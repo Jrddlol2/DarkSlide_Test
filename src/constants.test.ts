@@ -1,12 +1,39 @@
 import { describe, expect, it } from 'vitest';
 import {
   ASPECT_RATIOS,
+  FILM_PROFILES,
+  FILM_STOCK_DENSITY_PRESETS,
   LIGHT_SOURCE_PROFILES,
   createDefaultSettings,
   getSuggestedCsLiteLightSourceId,
   isCsLiteLightSourceId,
   resolveLightSourceIdForProfile,
 } from './constants';
+
+const CURRENT_STOCK_ADDITION_IDS = [
+  'ektacolor-pro-160',
+  'ektacolor-pro-400',
+  'ektacolor-pro-800',
+  'ektapan-100',
+  'ektapan-400',
+  'ektapan-p3200',
+  'vision3-50d',
+  'vision3-200t',
+  'verita-200d',
+  'ortho-plus',
+  'kentmere-100',
+  'harman-phoenix-200',
+  'harman-red-125',
+  'harman-switch-azure',
+  'lomo-metropolis',
+  'lomo-purple',
+  'lomo-turquoise',
+  'lomo-classicolor-200',
+  'lomo-redscale-xr',
+  'lomo-potsdam-100',
+  'lomo-berlin-400',
+  'cinestill-bwxx',
+] as const;
 
 describe('createDefaultSettings', () => {
   it('starts with a full-frame crop so imports are not auto-cropped', () => {
@@ -38,6 +65,45 @@ describe('ASPECT_RATIOS', () => {
       expect.objectContaining({ format: '6×9', value: 6 / 9 }),
       expect.objectContaining({ format: '6×9', value: 9 / 6 }),
     ]));
+  });
+});
+
+describe('FILM_PROFILES', () => {
+  it('includes current manufacturer-backed stock additions', () => {
+    const profileIds = FILM_PROFILES.map((profile) => profile.id);
+
+    expect(profileIds).toEqual(expect.arrayContaining([...CURRENT_STOCK_ADDITION_IDS]));
+  });
+
+  it('uses unique ids for built-in film profiles', () => {
+    const profileIds = FILM_PROFILES.map((profile) => profile.id);
+
+    expect(new Set(profileIds).size).toBe(profileIds.length);
+  });
+
+  it('provides density presets for every color negative stock', () => {
+    const colorNegativeProfiles = FILM_PROFILES.filter((profile) => (
+      profile.type === 'color'
+      && (profile.filmType ?? 'negative') === 'negative'
+    ));
+
+    for (const profile of colorNegativeProfiles) {
+      expect(FILM_STOCK_DENSITY_PRESETS[profile.id], profile.id).toBeTruthy();
+    }
+  });
+
+  it('keeps built-in profile settings and tonal behavior bounded', () => {
+    for (const profile of FILM_PROFILES) {
+      expect(profile.defaultSettings.blackPoint, profile.id).toBeGreaterThanOrEqual(0);
+      expect(profile.defaultSettings.blackPoint, profile.id).toBeLessThanOrEqual(80);
+      expect(profile.defaultSettings.whitePoint, profile.id).toBeGreaterThanOrEqual(180);
+      expect(profile.defaultSettings.whitePoint, profile.id).toBeLessThanOrEqual(255);
+      expect(profile.defaultSettings.saturation, profile.id).toBeGreaterThanOrEqual(0);
+      expect(profile.defaultSettings.saturation, profile.id).toBeLessThanOrEqual(160);
+      expect(profile.defaultSettings.highlightProtection, profile.id).toBeGreaterThanOrEqual(0);
+      expect(profile.defaultSettings.highlightProtection, profile.id).toBeLessThanOrEqual(100);
+      expect(profile.tonalCharacter, profile.id).toBeTruthy();
+    }
   });
 });
 
