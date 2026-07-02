@@ -1,4 +1,4 @@
-import { BatchProgressEvent, ColorManagementSettings, ColorProfileId, ConversionSettings, ExportOptions, FilmProfile, HistogramData, LabStyleProfile, SourceMetadata } from '../types';
+import { BatchProgressEvent, ColorManagementSettings, ColorProfileId, ConversionSettings, ExportOptions, FilmProfile, HistogramData, InputProfileSpec, LabStyleProfile, SourceMetadata } from '../types';
 import { ImageWorkerClient } from './imageWorkerClient';
 import { computeHighlightDensity, getExtensionFromFormat, getFileExtension, sanitizeFilenameBase } from './imagePipeline';
 import { decodeDesktopRawForWorker, isRawExtension } from './rawImport';
@@ -59,12 +59,12 @@ async function saveBatchExport(blob: Blob, filename: string, format: ExportOptio
   return saveExportBlob(blob, filename, format);
 }
 
-function resolveBatchInputProfileId(sourceMetadata: SourceMetadata | undefined, colorManagement: ColorManagementSettings): ColorProfileId {
+function resolveBatchInputProfileId(sourceMetadata: SourceMetadata | undefined, colorManagement: ColorManagementSettings): InputProfileSpec {
   if (colorManagement.inputMode === 'override') {
     return colorManagement.inputProfileId;
   }
 
-  return sourceMetadata?.decoderColorProfileId ?? sourceMetadata?.embeddedColorProfileId ?? 'srgb';
+  return sourceMetadata?.decoderColorProfileId ?? sourceMetadata?.embeddedColorProfileId ?? sourceMetadata?.embeddedParsedProfile ?? 'srgb';
 }
 
 async function analyzeBatchHighlightDensity(
@@ -74,7 +74,7 @@ async function analyzeBatchHighlightDensity(
     settings: ConversionSettings;
     isColor: boolean;
     filmType: FilmProfile['filmType'];
-    inputProfileId: ColorProfileId;
+    inputProfileId: InputProfileSpec;
     outputProfileId: ColorProfileId;
     maskTuning: FilmProfile['maskTuning'];
     colorMatrix: FilmProfile['colorMatrix'];

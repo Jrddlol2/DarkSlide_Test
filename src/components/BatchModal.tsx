@@ -756,7 +756,7 @@ export function BatchModal({
                                 disabled={colorManagement.inputMode === 'auto'}
                                 className="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-100 focus:border-zinc-600 focus:outline-none disabled:opacity-50"
                               >
-                                {(['srgb', 'display-p3', 'adobe-rgb'] as ColorProfileId[]).map((profileId) => (
+                                {(['srgb', 'display-p3', 'adobe-rgb', 'linear'] as ColorProfileId[]).map((profileId) => (
                                   <option key={profileId} value={profileId}>{getColorProfileDescription(profileId)}</option>
                                 ))}
                               </select>

@@ -19,6 +19,7 @@ import {
   FilmProfileType,
   HistogramData,
   HistogramMode,
+  InputProfileSpec,
   InteractionQuality,
   PreparedPreviewBitmapResult,
   PrepareTileJobRequest,
@@ -41,7 +42,7 @@ import { appendDiagnostic } from './diagnostics';
 import { pushToast } from './toastStore';
 import { accumulateHistogram, buildEmptyHistogram, computeHighlightDensity, getExtensionFromFormat, sanitizeFilenameBase } from './imagePipeline';
 import { getBlobUrlDiagnostics } from './blobUrlTracker';
-import { convertImageDataColorProfile, getPreferredPreviewDisplayProfile } from './colorProfiles';
+import { convertImageDataColorProfile, getInputProfileLabel, getPreferredPreviewDisplayProfile } from './colorProfiles';
 import { WebGPUPipeline } from './gpu/WebGPUPipeline';
 import { finalizeExportBlob } from './imageMetadata';
 import { WorkerMessage, WorkerRequest, WorkerResponse } from './workerProtocol';
@@ -818,7 +819,7 @@ export class ImageWorkerClient {
         baseDensity: debug.baseDensity.map((value) => value.toFixed(3)).join('/'),
         densityScale: debug.densityScale.map((value) => value.toFixed(3)).join('/'),
         densityScaleSource: debug.densityScaleSource,
-        inputProfileId: debug.inputProfileId,
+        inputProfileId: getInputProfileLabel(debug.inputProfileId),
         outputProfileId: debug.outputProfileId,
         flareFloor: debug.flareFloor ? debug.flareFloor.map((value) => value.toFixed(1)).join('/') : null,
         residualBaseOffset: debug.residualBaseOffset
@@ -856,7 +857,7 @@ export class ImageWorkerClient {
     settings: ConversionSettings,
     isColor: boolean,
     comparisonMode: 'processed' | 'original',
-    inputProfileId: ColorProfileId,
+    inputProfileId: InputProfileSpec,
     outputProfileId: ColorProfileId,
     profileId?: RenderRequest['profileId'],
     maskTuning?: RenderRequest['maskTuning'],
@@ -938,7 +939,7 @@ export class ImageWorkerClient {
     isColor: boolean,
     comparisonMode: 'processed' | 'original',
     histogramMode: HistogramMode,
-    inputProfileId: ColorProfileId,
+    inputProfileId: InputProfileSpec,
     outputProfileId: ColorProfileId,
     displayProfileId: ColorProfileId,
     profileId?: RenderRequest['profileId'],

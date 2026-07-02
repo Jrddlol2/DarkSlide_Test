@@ -1,7 +1,30 @@
 export type FilmType = 'color' | 'bw';
 export type CropTab = 'Film' | 'Print' | 'Social' | 'Digital';
 export type ScannerType = 'flatbed' | 'camera' | 'dedicated' | 'smartphone';
-export type ColorProfileId = 'srgb' | 'display-p3' | 'adobe-rgb';
+export type ColorProfileId = 'srgb' | 'display-p3' | 'adobe-rgb' | 'linear';
+
+// Transfer curve resolved from an embedded ICC profile. Table and parametric
+// TRCs are reduced to one of these two shapes at parse time so the CPU
+// pipeline and the WGSL shader consume the exact same description.
+export type ParsedTransferCurve =
+  | { type: 'srgb' }
+  | { type: 'gamma'; gamma: number };
+
+// Input profile parsed numerically from an embedded ICC (matrix + TRC or
+// gray). Serializable so it can cross the worker boundary and be persisted
+// with the document. Only ever used on the input side of the pipeline —
+// outputs stay on the built-in ColorProfileId set.
+export interface ParsedInputProfile {
+  kind: 'parsed-icc';
+  name: string;
+  colorSpace: 'rgb' | 'gray';
+  /** Linear RGB → XYZ (D65-adapted), row-major 3×3. */
+  toXyzD65: number[];
+  trc: ParsedTransferCurve;
+}
+
+/** Anything the pipeline accepts as an input color profile. */
+export type InputProfileSpec = ColorProfileId | ParsedInputProfile;
 export type FilmProfileType = 'negative' | 'slide';
 export type FilmProfileCategory = 'Kodak' | 'Fuji' | 'Ilford' | 'CineStill' | 'Lomography' | 'Harman' | 'Kentmere' | 'Foma' | 'Rollei' | 'Generic';
 export type CropSource = 'auto' | 'manual';
@@ -336,6 +359,10 @@ export interface SourceMetadata {
   exif?: ExifMetadata;
   embeddedColorProfileName?: string | null;
   embeddedColorProfileId?: ColorProfileId | null;
+  // Set when the embedded ICC didn't match a built-in profile by name but was
+  // parsed numerically (matrix + TRC or gray). Takes part in auto input
+  // profile resolution alongside embeddedColorProfileId.
+  embeddedParsedProfile?: ParsedInputProfile | null;
   decoderColorProfileName?: string | null;
   decoderColorProfileId?: ColorProfileId | null;
   unsupportedColorProfileName?: string | null;
@@ -419,7 +446,7 @@ export interface RenderRequest {
   filmType?: FilmProfileType;
   estimatedFilmBaseSample?: FilmBaseSample | null;
   estimatedDensityBalance?: DensityBalance | null;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   revision: number;
   targetMaxDimension: number;
@@ -471,7 +498,7 @@ export interface ExportRequest {
   profileId?: string | null;
   filmType?: FilmProfileType;
   estimatedDensityBalance?: DensityBalance | null;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   options: ExportOptions;
   sourceExif?: ExifMetadata;
@@ -662,7 +689,7 @@ export interface AutoAnalyzeRequest {
   isColor: boolean;
   profileId?: string | null;
   filmType?: FilmProfileType;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   targetMaxDimension: number;
   maskTuning?: MaskTuning;
@@ -688,7 +715,7 @@ export interface ConversionAnalysisRequest {
   isColor: boolean;
   profileId?: string | null;
   filmType?: FilmProfileType;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   lightSourceBias?: [number, number, number];
   flareFloor?: [number, number, number] | null;
@@ -707,7 +734,7 @@ export interface ConversionParametersDebug {
   baseDensity: [number, number, number];
   densityScale: [number, number, number];
   densityScaleSource: DensityBalance['source'] | 'neutral';
-  inputProfileId: ColorProfileId;
+  inputProfileId: InputProfileSpec;
   outputProfileId: ColorProfileId;
   flareFloor: [number, number, number] | null;
   residualBaseOffset: [number, number, number] | null;
@@ -757,7 +784,7 @@ export interface AutoAnalyzeResult {
 export interface SampleRequest {
   documentId: string;
   settings: ConversionSettings;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   targetMaxDimension: number;
   x: number;

@@ -9,6 +9,7 @@ import {
   FilmBaseSample,
   FilmProfileType,
   HistogramData,
+  InputProfileSpec,
   MaskTuning,
   PreviewLevel,
   TonalCharacter,
@@ -334,7 +335,7 @@ function resolveDensityBalance(
 
 function convertEstimatedFilmBaseSampleToWorkingProfile(
   sample: FilmBaseSample,
-  inputProfileId: ColorProfileId,
+  inputProfileId: InputProfileSpec,
   outputProfileId: ColorProfileId,
 ): FilmBaseSample {
   const [r, g, b] = convertRgbBetweenProfiles(
@@ -371,7 +372,7 @@ export function resolveDensityInversionParams(
   profileId: string | null = null,
   estimatedFilmBaseSample: FilmBaseSample | null = null,
   estimatedDensityBalance: DensityBalance | null = null,
-  inputProfileId: ColorProfileId = 'srgb',
+  inputProfileId: InputProfileSpec = 'srgb',
   outputProfileId: ColorProfileId = 'srgb',
   flareFloor: [number, number, number] | null = null,
   flareStrength = 0.5,
@@ -557,7 +558,7 @@ export function computeResidualBaseOffset(
   settings: ConversionSettings,
   isColor: boolean,
   filmType: FilmProfileType = 'negative',
-  inputProfileId: ColorProfileId = 'srgb',
+  inputProfileId: InputProfileSpec = 'srgb',
   outputProfileId: ColorProfileId = 'srgb',
   lightSourceBias: [number, number, number] = [1, 1, 1],
   flareFloor: [number, number, number] | null = null,
@@ -734,7 +735,7 @@ export function buildProcessingUniforms(
   labSaturationBias = 0,
   labTemperatureBias = 0,
   highlightDensityEstimate = 0,
-  inputProfileId: ColorProfileId = 'srgb',
+  inputProfileId: InputProfileSpec = 'srgb',
   outputProfileId: ColorProfileId = 'srgb',
   profileId: string | null = null,
   filmType: FilmProfileType = 'negative',
@@ -1031,7 +1032,7 @@ export function processImageData(
   labSaturationBias = 0,
   labTemperatureBias = 0,
   highlightDensityEstimate = 0,
-  inputProfileId: ColorProfileId = 'srgb',
+  inputProfileId: InputProfileSpec = 'srgb',
   outputProfileId: ColorProfileId = 'srgb',
   profileId: string | null = null,
   filmType: FilmProfileType = 'negative',

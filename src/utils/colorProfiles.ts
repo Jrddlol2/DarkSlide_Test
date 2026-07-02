@@ -1,4 +1,4 @@
-import { ColorProfileId } from '../types';
+import { ColorProfileId, InputProfileSpec, ParsedInputProfile, ParsedTransferCurve } from '../types';
 
 const D50_WHITE_POINT: [number, number, number] = [0.9642, 1, 0.8249];
 const D65_WHITE_POINT: [number, number, number] = [0.95047, 1, 1.08883];
@@ -13,24 +13,36 @@ const BRADFORD_INVERSE = [
   -0.0085287, 0.0400428, 0.9684867,
 ] as const;
 
+const ADOBE_RGB_GAMMA = 2.19921875;
+
 const PROFILE_DESCRIPTIONS: Record<ColorProfileId, string> = {
   srgb: 'sRGB IEC61966-2.1',
   'display-p3': 'Display P3',
   'adobe-rgb': 'Adobe RGB (1998)',
+  linear: 'Linear RGB (gamma 1.0)',
 };
 
 const PROFILE_COPYRIGHTS: Record<ColorProfileId, string> = {
   srgb: 'DarkSlide generated sRGB profile',
   'display-p3': 'DarkSlide generated Display P3 profile',
   'adobe-rgb': 'DarkSlide generated Adobe RGB (1998) profile',
+  linear: 'DarkSlide generated linear sRGB profile',
 };
 
+const SRGB_LINEAR_TO_XYZ_D65 = [
+  0.4124564, 0.3575761, 0.1804375,
+  0.2126729, 0.7151522, 0.0721750,
+  0.0193339, 0.1191920, 0.9503041,
+] as const;
+
+const SRGB_XYZ_D65_TO_LINEAR = [
+  3.2404542, -1.5371385, -0.4985314,
+  -0.9692660, 1.8760108, 0.0415560,
+  0.0556434, -0.2040259, 1.0572252,
+] as const;
+
 const LINEAR_TO_XYZ_D65: Record<ColorProfileId, readonly number[]> = {
-  srgb: [
-    0.4124564, 0.3575761, 0.1804375,
-    0.2126729, 0.7151522, 0.0721750,
-    0.0193339, 0.1191920, 0.9503041,
-  ],
+  srgb: SRGB_LINEAR_TO_XYZ_D65,
   'display-p3': [
     0.48657095, 0.26566769, 0.19821729,
     0.22897456, 0.69173852, 0.07928691,
@@ -41,14 +53,11 @@ const LINEAR_TO_XYZ_D65: Record<ColorProfileId, readonly number[]> = {
     0.2973769, 0.6273491, 0.0752741,
     0.0270343, 0.0706872, 0.9911085,
   ],
+  linear: SRGB_LINEAR_TO_XYZ_D65,
 };
 
 const XYZ_D65_TO_LINEAR: Record<ColorProfileId, readonly number[]> = {
-  srgb: [
-    3.2404542, -1.5371385, -0.4985314,
-    -0.9692660, 1.8760108, 0.0415560,
-    0.0556434, -0.2040259, 1.0572252,
-  ],
+  srgb: SRGB_XYZ_D65_TO_LINEAR,
   'display-p3': [
     2.49349691, -0.93138362, -0.40271078,
     -0.82948897, 1.76266406, 0.02362469,
@@ -59,6 +68,7 @@ const XYZ_D65_TO_LINEAR: Record<ColorProfileId, readonly number[]> = {
     -0.9692660, 1.8760108, 0.0415560,
     0.0134474, -0.1183897, 1.0154096,
   ],
+  linear: SRGB_XYZ_D65_TO_LINEAR,
 };
 
 const iccProfileCache = new Map<ColorProfileId, Uint8Array>();
@@ -170,7 +180,7 @@ function createIccProfile(profileId: ColorProfileId) {
     chromaticAdaptationMatrix(D65_WHITE_POINT, D50_WHITE_POINT),
     LINEAR_TO_XYZ_D65[profileId],
   );
-  const gamma = profileId === 'adobe-rgb' ? 2.19921875 : 2.2;
+  const gamma = profileId === 'adobe-rgb' ? ADOBE_RGB_GAMMA : (profileId === 'linear' ? 1.0 : 2.2);
   const tags = [
     { signature: 'desc', data: buildDescTag(description) },
     { signature: 'cprt', data: buildTextTag(PROFILE_COPYRIGHTS[profileId]) },
@@ -392,42 +402,426 @@ export function identifyIccProfile(iccBytes: Uint8Array | null | undefined, fall
   };
 }
 
-function decodeChannel(profileId: ColorProfileId, value: number) {
-  const normalized = clamp01(value);
-  if (profileId === 'adobe-rgb') {
-    return normalized ** 2.19921875;
-  }
+function srgbDecode(normalized: number) {
   if (normalized <= 0.04045) {
     return normalized / 12.92;
   }
   return ((normalized + 0.055) / 1.055) ** 2.4;
 }
 
-function encodeChannel(profileId: ColorProfileId, value: number) {
-  const normalized = clamp01(value);
-  if (profileId === 'adobe-rgb') {
-    return normalized ** (1 / 2.19921875);
-  }
+function srgbEncode(normalized: number) {
   if (normalized <= 0.0031308) {
     return normalized * 12.92;
   }
   return 1.055 * (normalized ** (1 / 2.4)) - 0.055;
 }
 
-export function decodeProfileChannel(profileId: ColorProfileId, value: number) {
-  return decodeChannel(profileId, value);
+// Resolve any input profile to its transfer curve. Must stay in exact parity
+// with decodeTransfer/encodeTransfer in tiledRender.wgsl: sRGB piecewise, or a
+// pure power law.
+function getProfileTrc(profile: InputProfileSpec): ParsedTransferCurve {
+  if (typeof profile !== 'string') {
+    return profile.trc;
+  }
+  if (profile === 'adobe-rgb') {
+    return { type: 'gamma', gamma: ADOBE_RGB_GAMMA };
+  }
+  if (profile === 'linear') {
+    return { type: 'gamma', gamma: 1 };
+  }
+  return { type: 'srgb' };
 }
 
-export function encodeProfileChannel(profileId: ColorProfileId, value: number) {
-  return encodeChannel(profileId, value);
+// ─── Numeric ICC parsing (audit Phase D) ────────────────────────────────────
+// Matrix + TRC profiles (rXYZ/gXYZ/bXYZ + curv/para TRCs) and gray profiles
+// (kTRC) are parsed numerically so scanner profiles — including gamma-1.0
+// "linear" scan profiles — are honored instead of silently falling back to
+// sRGB. Only profiles whose curves reduce to the sRGB curve or a pure power
+// law are accepted: that is what the CPU pipeline and the WGSL shader can
+// evaluate in exact parity.
+
+const TRC_SAMPLE_COUNT = 64;
+const TRC_MATCH_TOLERANCE = 1.5 / 255;
+const MATRIX_MATCH_TOLERANCE = 0.02;
+const GAMMA_MATCH_TOLERANCE = 0.03;
+
+type TrcEvaluator = (x: number) => number;
+
+export interface ParsedIccResult {
+  profileId: ColorProfileId | null;
+  parsedProfile: ParsedInputProfile | null;
+  profileName: string | null;
 }
 
-export function getTransferMode(profileId: ColorProfileId) {
-  return profileId === 'adobe-rgb' ? 1 : 0;
+function readUint16At(bytes: Uint8Array, offset: number) {
+  if (offset < 0 || offset + 2 > bytes.length) {
+    return null;
+  }
+  return (bytes[offset] << 8) | bytes[offset + 1];
 }
 
-export function getLinearTransformMatrix(fromProfileId: ColorProfileId, toProfileId: ColorProfileId) {
-  if (fromProfileId === toProfileId) {
+function readS15Fixed16(bytes: Uint8Array, offset: number) {
+  const raw = readUint32(bytes, offset);
+  if (raw === null) {
+    return null;
+  }
+  const signed = raw > 0x7fffffff ? raw - 0x1_0000_0000 : raw;
+  return signed / 65_536;
+}
+
+function buildIccTagTable(iccBytes: Uint8Array) {
+  if (iccBytes.length < 132 || bytesToAscii(iccBytes.subarray(36, 40)) !== 'acsp') {
+    return null;
+  }
+
+  const tagCount = readUint32(iccBytes, 128);
+  if (!tagCount || tagCount > 128) {
+    return null;
+  }
+
+  const table = new Map<string, { offset: number; length: number }>();
+  for (let index = 0; index < tagCount; index += 1) {
+    const entryOffset = 132 + index * 12;
+    const tagOffset = readUint32(iccBytes, entryOffset + 4);
+    const tagLength = readUint32(iccBytes, entryOffset + 8);
+    if (tagOffset === null || tagLength === null) {
+      return null;
+    }
+    table.set(bytesToAscii(iccBytes.subarray(entryOffset, entryOffset + 4)), { offset: tagOffset, length: tagLength });
+  }
+
+  return table;
+}
+
+function parseXyzTagVector(tagBytes: Uint8Array | null): [number, number, number] | null {
+  if (!tagBytes || tagBytes.length < 20 || bytesToAscii(tagBytes.subarray(0, 4)) !== 'XYZ ') {
+    return null;
+  }
+
+  const x = readS15Fixed16(tagBytes, 8);
+  const y = readS15Fixed16(tagBytes, 12);
+  const z = readS15Fixed16(tagBytes, 16);
+  return x !== null && y !== null && z !== null ? [x, y, z] : null;
+}
+
+function parseCurvTag(tagBytes: Uint8Array): TrcEvaluator | null {
+  const count = readUint32(tagBytes, 8);
+  if (count === null) {
+    return null;
+  }
+  if (count === 0) {
+    return (x) => x;
+  }
+  if (count === 1) {
+    const raw = readUint16At(tagBytes, 12);
+    if (!raw) {
+      return null;
+    }
+    const gamma = raw / 256;
+    return (x) => x ** gamma;
+  }
+  if (12 + count * 2 > tagBytes.length) {
+    return null;
+  }
+
+  const table = new Float64Array(count);
+  for (let index = 0; index < count; index += 1) {
+    table[index] = (readUint16At(tagBytes, 12 + index * 2) ?? 0) / 65_535;
+  }
+  return (x) => {
+    const position = clamp01(x) * (count - 1);
+    const lower = Math.floor(position);
+    const upper = Math.min(count - 1, lower + 1);
+    const fraction = position - lower;
+    return table[lower] + (table[upper] - table[lower]) * fraction;
+  };
+}
+
+function parseParaTag(tagBytes: Uint8Array): TrcEvaluator | null {
+  const functionType = readUint16At(tagBytes, 8);
+  const parameterCounts = [1, 3, 4, 5, 7];
+  if (functionType === null || functionType >= parameterCounts.length) {
+    return null;
+  }
+
+  const parameters: number[] = [];
+  for (let index = 0; index < parameterCounts[functionType]; index += 1) {
+    const value = readS15Fixed16(tagBytes, 12 + index * 4);
+    if (value === null) {
+      return null;
+    }
+    parameters.push(value);
+  }
+
+  const [g, a = 1, b = 0, c = 0, d = 0, e = 0, f = 0] = parameters;
+  const power = (base: number) => (base > 0 ? base ** g : 0);
+  switch (functionType) {
+    case 0:
+      return (x) => power(x);
+    case 1:
+      return (x) => (x >= -b / a ? power(a * x + b) : 0);
+    case 2:
+      return (x) => (x >= -b / a ? power(a * x + b) + c : c);
+    case 3:
+      return (x) => (x >= d ? power(a * x + b) : c * x);
+    default:
+      return (x) => (x >= d ? power(a * x + b) + e : c * x + f);
+  }
+}
+
+function parseTrcTag(tagBytes: Uint8Array | null): TrcEvaluator | null {
+  if (!tagBytes || tagBytes.length < 12) {
+    return null;
+  }
+
+  const tagType = bytesToAscii(tagBytes.subarray(0, 4));
+  if (tagType === 'curv') {
+    return parseCurvTag(tagBytes);
+  }
+  if (tagType === 'para') {
+    return parseParaTag(tagBytes);
+  }
+  return null;
+}
+
+// Reduce an arbitrary TRC to the sRGB curve or a pure power law by sampling.
+// Returns null when the curve fits neither within tolerance — that counts as
+// a parse failure and falls back to sRGB (loudly) upstream.
+function classifyTrcEvaluator(evaluate: TrcEvaluator): ParsedTransferCurve | null {
+  let maxSrgbError = 0;
+  for (let index = 0; index <= TRC_SAMPLE_COUNT; index += 1) {
+    const x = index / TRC_SAMPLE_COUNT;
+    const value = evaluate(x);
+    if (!Number.isFinite(value)) {
+      return null;
+    }
+    maxSrgbError = Math.max(maxSrgbError, Math.abs(value - srgbDecode(x)));
+  }
+  if (maxSrgbError <= TRC_MATCH_TOLERANCE) {
+    return { type: 'srgb' };
+  }
+
+  // Log-log least-squares gamma fit, weighted away from the noisy dark end.
+  let numerator = 0;
+  let denominator = 0;
+  for (let index = 1; index <= TRC_SAMPLE_COUNT; index += 1) {
+    const x = index / TRC_SAMPLE_COUNT;
+    const value = evaluate(x);
+    if (x < 0.05 || value <= 0 || x === 1) {
+      continue;
+    }
+    numerator += Math.log(x) * Math.log(value);
+    denominator += Math.log(x) ** 2;
+  }
+  if (denominator === 0) {
+    return null;
+  }
+
+  const gamma = numerator / denominator;
+  if (!Number.isFinite(gamma) || gamma < 0.2 || gamma > 6) {
+    return null;
+  }
+
+  for (let index = 0; index <= TRC_SAMPLE_COUNT; index += 1) {
+    const x = index / TRC_SAMPLE_COUNT;
+    if (Math.abs(evaluate(x) - x ** gamma) > TRC_MATCH_TOLERANCE) {
+      return null;
+    }
+  }
+
+  return { type: 'gamma', gamma };
+}
+
+function matricesMatch(left: readonly number[], right: readonly number[]) {
+  for (let index = 0; index < 9; index += 1) {
+    if (Math.abs(left[index] - right[index]) > MATRIX_MATCH_TOLERANCE) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isGammaNear(trc: ParsedTransferCurve, gamma: number) {
+  return trc.type === 'gamma' && Math.abs(trc.gamma - gamma) <= GAMMA_MATCH_TOLERANCE;
+}
+
+// Map a parsed matrix + TRC onto a built-in profile when they agree
+// numerically, so differently-named scanner variants of standard spaces land
+// on the exact built-in math.
+function matchBuiltinProfile(toXyzD65: readonly number[], trc: ParsedTransferCurve): ColorProfileId | null {
+  if (matricesMatch(toXyzD65, LINEAR_TO_XYZ_D65.srgb)) {
+    if (trc.type === 'srgb') {
+      return 'srgb';
+    }
+    if (isGammaNear(trc, 1)) {
+      return 'linear';
+    }
+  }
+  if (trc.type === 'srgb' && matricesMatch(toXyzD65, LINEAR_TO_XYZ_D65['display-p3'])) {
+    return 'display-p3';
+  }
+  if (isGammaNear(trc, ADOBE_RGB_GAMMA) && matricesMatch(toXyzD65, LINEAR_TO_XYZ_D65['adobe-rgb'])) {
+    return 'adobe-rgb';
+  }
+  return null;
+}
+
+function isPlausibleColorantMatrix(matrix: readonly number[]) {
+  if (matrix.some((value) => !Number.isFinite(value) || value < -0.5 || value > 2)) {
+    return false;
+  }
+
+  const luminanceSum = matrix[3] + matrix[4] + matrix[5];
+  return luminanceSum > 0.6 && luminanceSum < 1.4;
+}
+
+/**
+ * Identify an embedded ICC input profile: name matching first (exact built-in
+ * behavior preserved), then numeric matrix+TRC / gray parsing. Returns a
+ * built-in profile id, a parsed custom profile, or neither (parse failure —
+ * the caller falls back to sRGB and must surface that).
+ */
+export function parseInputIccProfile(iccBytes: Uint8Array | null | undefined): ParsedIccResult {
+  const identified = identifyIccProfile(iccBytes);
+  if (identified.profileId || !iccBytes || iccBytes.length < 132) {
+    return { ...identified, parsedProfile: null };
+  }
+
+  const failure: ParsedIccResult = {
+    profileId: null,
+    parsedProfile: null,
+    profileName: extractIccProfileLabels(iccBytes)[0] ?? null,
+  };
+  const table = buildIccTagTable(iccBytes);
+  if (!table) {
+    return failure;
+  }
+
+  const getTagBytes = (signature: string) => {
+    const entry = table.get(signature);
+    return entry ? sliceBytes(iccBytes, entry.offset, entry.length) : null;
+  };
+  const name = failure.profileName ?? 'Embedded ICC profile';
+  const colorSpace = bytesToAscii(iccBytes.subarray(16, 20));
+
+  if (colorSpace === 'GRAY') {
+    const evaluate = parseTrcTag(getTagBytes('kTRC'));
+    const trc = evaluate ? classifyTrcEvaluator(evaluate) : null;
+    if (!trc) {
+      return failure;
+    }
+    // Gray scans reach the pipeline with the single channel replicated to
+    // R=G=B, so primaries are irrelevant — carry sRGB primaries and let the
+    // parsed TRC drive the decode.
+    if (trc.type === 'srgb') {
+      return { profileId: 'srgb', parsedProfile: null, profileName: name };
+    }
+    if (isGammaNear(trc, 1)) {
+      return { profileId: 'linear', parsedProfile: null, profileName: name };
+    }
+    return {
+      profileId: null,
+      profileName: name,
+      parsedProfile: { kind: 'parsed-icc', name, colorSpace: 'gray', toXyzD65: [...SRGB_LINEAR_TO_XYZ_D65], trc },
+    };
+  }
+
+  if (colorSpace !== 'RGB ') {
+    return failure;
+  }
+
+  const red = parseXyzTagVector(getTagBytes('rXYZ'));
+  const green = parseXyzTagVector(getTagBytes('gXYZ'));
+  const blue = parseXyzTagVector(getTagBytes('bXYZ'));
+  if (!red || !green || !blue) {
+    return failure;
+  }
+
+  const channelCurves = ['rTRC', 'gTRC', 'bTRC'].map((signature) => {
+    const evaluate = parseTrcTag(getTagBytes(signature));
+    return evaluate ? classifyTrcEvaluator(evaluate) : null;
+  });
+  if (channelCurves.some((curve) => curve === null)) {
+    return failure;
+  }
+
+  // The pipeline decodes all channels with one shared curve; profiles with
+  // meaningfully different per-channel TRCs are rare among scanner matrix
+  // profiles and are treated as unsupported rather than approximated.
+  let trc: ParsedTransferCurve;
+  if (channelCurves.every((curve) => curve!.type === 'srgb')) {
+    trc = { type: 'srgb' };
+  } else if (channelCurves.every((curve) => curve!.type === 'gamma')) {
+    const gammas = channelCurves.map((curve) => (curve as { gamma: number }).gamma);
+    if (Math.max(...gammas) - Math.min(...gammas) > 2 * GAMMA_MATCH_TOLERANCE) {
+      return failure;
+    }
+    trc = { type: 'gamma', gamma: (gammas[0] + gammas[1] + gammas[2]) / 3 };
+  } else {
+    return failure;
+  }
+
+  // ICC colorants are media-relative XYZ under the D50 PCS; Bradford-adapt to
+  // the D65 working assumption shared by the built-in profile matrices.
+  const toXyzD50 = [
+    red[0], green[0], blue[0],
+    red[1], green[1], blue[1],
+    red[2], green[2], blue[2],
+  ];
+  const toXyzD65 = multiplyMatrix3x3(chromaticAdaptationMatrix(D50_WHITE_POINT, D65_WHITE_POINT), toXyzD50);
+  if (!isPlausibleColorantMatrix(toXyzD65)) {
+    return failure;
+  }
+
+  const builtin = matchBuiltinProfile(toXyzD65, trc);
+  if (builtin) {
+    return { profileId: builtin, parsedProfile: null, profileName: name };
+  }
+
+  return {
+    profileId: null,
+    profileName: name,
+    parsedProfile: { kind: 'parsed-icc', name, colorSpace: 'rgb', toXyzD65: [...toXyzD65], trc },
+  };
+}
+
+export function getInputProfileLabel(profile: InputProfileSpec) {
+  return typeof profile === 'string' ? PROFILE_DESCRIPTIONS[profile] : profile.name;
+}
+
+function decodeChannel(profile: InputProfileSpec, value: number) {
+  const normalized = clamp01(value);
+  const trc = getProfileTrc(profile);
+  return trc.type === 'gamma' ? normalized ** trc.gamma : srgbDecode(normalized);
+}
+
+function encodeChannel(profile: InputProfileSpec, value: number) {
+  const normalized = clamp01(value);
+  const trc = getProfileTrc(profile);
+  return trc.type === 'gamma' ? normalized ** (1 / trc.gamma) : srgbEncode(normalized);
+}
+
+export function decodeProfileChannel(profile: InputProfileSpec, value: number) {
+  return decodeChannel(profile, value);
+}
+
+export function encodeProfileChannel(profile: InputProfileSpec, value: number) {
+  return encodeChannel(profile, value);
+}
+
+// Transfer mode as consumed by the WGSL shader: 0 selects the sRGB piecewise
+// curve, any positive value is a pure gamma exponent.
+export function getTransferMode(profile: InputProfileSpec) {
+  const trc = getProfileTrc(profile);
+  return trc.type === 'gamma' ? trc.gamma : 0;
+}
+
+function getInputLinearToXyzD65(profile: InputProfileSpec) {
+  return typeof profile === 'string' ? LINEAR_TO_XYZ_D65[profile] : profile.toXyzD65;
+}
+
+export function getLinearTransformMatrix(fromProfile: InputProfileSpec, toProfileId: ColorProfileId) {
+  if (fromProfile === toProfileId) {
     return [
       1, 0, 0,
       0, 1, 0,
@@ -435,26 +829,26 @@ export function getLinearTransformMatrix(fromProfileId: ColorProfileId, toProfil
     ] as const;
   }
 
-  return multiplyMatrix3x3(XYZ_D65_TO_LINEAR[toProfileId], LINEAR_TO_XYZ_D65[fromProfileId]);
+  return multiplyMatrix3x3(XYZ_D65_TO_LINEAR[toProfileId], getInputLinearToXyzD65(fromProfile));
 }
 
 export function convertRgbBetweenProfiles(
   r: number,
   g: number,
   b: number,
-  fromProfileId: ColorProfileId,
+  fromProfile: InputProfileSpec,
   toProfileId: ColorProfileId,
 ): [number, number, number] {
-  if (fromProfileId === toProfileId) {
+  if (fromProfile === toProfileId) {
     return [clamp01(r), clamp01(g), clamp01(b)];
   }
 
   const linear = [
-    decodeChannel(fromProfileId, r),
-    decodeChannel(fromProfileId, g),
-    decodeChannel(fromProfileId, b),
+    decodeChannel(fromProfile, r),
+    decodeChannel(fromProfile, g),
+    decodeChannel(fromProfile, b),
   ] as const;
-  const matrix = getLinearTransformMatrix(fromProfileId, toProfileId);
+  const matrix = getLinearTransformMatrix(fromProfile, toProfileId);
   const transformed = multiplyMatrix3x3Vector(matrix, linear);
 
   return [
@@ -478,7 +872,7 @@ export class ColorProfileConversionError extends Error {
 
 export function convertImageDataColorProfile(
   imageData: ImageData,
-  fromProfileId: ColorProfileId,
+  fromProfileId: InputProfileSpec,
   toProfileId: ColorProfileId,
 ) {
   if (fromProfileId === toProfileId) {
@@ -494,8 +888,8 @@ export function convertImageDataColorProfile(
     getLinearTransformMatrix(fromProfileId, toProfileId);
   } catch (error) {
     throw new ColorProfileConversionError(
-      `Cannot build color transform from "${fromProfileId}" to "${toProfileId}".`,
-      fromProfileId,
+      `Cannot build color transform from "${getInputProfileLabel(fromProfileId)}" to "${toProfileId}".`,
+      typeof fromProfileId === 'string' ? fromProfileId : fromProfileId.name,
       toProfileId,
       error,
     );

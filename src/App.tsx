@@ -5,7 +5,7 @@ import { AppShell } from './components/AppShell';
 import { RollInfoModal } from './components/RollInfoModal';
 import { useScanningSessionWindow } from './hooks/useScanningSessionWindow';
 import { UpdateBanner } from './components/UpdateBanner';
-import { ColorManagementSettings, ColorMatrix, ConversionSettings, CropTab, DocumentHistoryEntry, ExportOptions, FilmProfile, HistogramMode, InteractionQuality, LabStyleProfile, MaskTuning, NotificationSettings, PointPickerMode, RenderBackendDiagnostics, Roll, TonalCharacter, UpdateChannel, WorkspaceDocument } from './types';
+import { ColorManagementSettings, ColorMatrix, ConversionSettings, CropTab, DocumentHistoryEntry, ExportOptions, FilmProfile, HistogramMode, InputProfileSpec, InteractionQuality, LabStyleProfile, MaskTuning, NotificationSettings, PointPickerMode, RenderBackendDiagnostics, Roll, TonalCharacter, UpdateChannel, WorkspaceDocument } from './types';
 import { useCustomPresets } from './hooks/useCustomPresets';
 import { useAppShortcuts } from './hooks/useAppShortcuts';
 import { useDocumentTabs } from './hooks/useDocumentTabs';
@@ -302,7 +302,7 @@ export default function App() {
     filmType?: 'negative' | 'slide';
     comparisonMode: 'processed' | 'original';
     targetMaxDimension: number;
-    inputProfileId: string;
+    inputProfileId: InputProfileSpec;
     outputProfileId: string;
     maskTuning?: MaskTuning;
     colorMatrix?: ColorMatrix;

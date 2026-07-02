@@ -20,7 +20,9 @@ import {
   ExportResult,
   FilmBaseSample,
   FilmProfileType,
+  InputProfileSpec,
   PreparePreviewBitmapRequest,
+  ParsedInputProfile,
   PreparedPreviewBitmapResult,
   PreparedTileJobResult,
   PreviewLevel,
@@ -57,7 +59,7 @@ import {
 import { analyzeChannelFloors, analyzeColorBalance, analyzeExposure, analyzeMidtoneContrast } from './autoAnalysis';
 import { MAX_FILE_SIZE_BYTES, PREVIEW_LEVELS, RAW_EXTENSIONS, resolveDustRemovalSettings } from '../constants';
 import { decodeTiffRaster, TiffDecodeError } from './tiff';
-import { convertImageDataColorProfile, getColorProfileIdFromName, identifyIccProfile } from './colorProfiles';
+import { convertImageDataColorProfile, getColorProfileIdFromName, parseInputIccProfile } from './colorProfiles';
 import { extractExifMetadata, extractRasterColorProfile } from './imageMetadata';
 import { detectDustMarks } from './dustDetection';
 import { detectFrame } from './frameDetection';
@@ -398,7 +400,7 @@ function getPinnedResidualBaseOffset(
   settings: ConversionSettings,
   isColor: boolean,
   filmType: FilmProfileType = 'negative',
-  inputProfileId: ColorProfileId = 'srgb',
+  inputProfileId: InputProfileSpec = 'srgb',
   outputProfileId: ColorProfileId = 'srgb',
   lightSourceBias: [number, number, number] = [1, 1, 1],
   flareFloor: [number, number, number] | null = null,
@@ -638,12 +640,12 @@ function getStoredDocument(documentId: string) {
   return document;
 }
 
-function resolveStoredInputProfileId(document: StoredDocument, inputMode: 'auto' | 'override', inputProfileId: ColorProfileId) {
+function resolveStoredInputProfileId(document: StoredDocument, inputMode: 'auto' | 'override', inputProfileId: ColorProfileId): InputProfileSpec {
   if (inputMode === 'override') {
     return inputProfileId;
   }
 
-  return document.metadata.decoderColorProfileId ?? document.metadata.embeddedColorProfileId ?? 'srgb';
+  return document.metadata.decoderColorProfileId ?? document.metadata.embeddedColorProfileId ?? document.metadata.embeddedParsedProfile ?? 'srgb';
 }
 
 function getHalo(settings: ConversionSettings, comparisonMode: 'processed' | 'original') {
@@ -976,7 +978,7 @@ interface AnalysisInversionOptions {
 function applyAnalysisInversionStage(
   imageData: ImageData,
   options: AnalysisInversionOptions,
-  inputProfileId: ColorProfileId,
+  inputProfileId: InputProfileSpec,
   outputProfileId: ColorProfileId,
   document: StoredDocument,
   residualBaseOffset: [number, number, number] | null,
@@ -1154,6 +1156,7 @@ async function handleDecode(payload: DecodeRequest) {
   let exif: SourceMetadata['exif'];
   let embeddedColorProfileName: string | null = null;
   let embeddedColorProfileId: ColorProfileId | null = null;
+  let embeddedParsedProfile: ParsedInputProfile | null = null;
   let unsupportedColorProfileName: string | null = null;
 
   try {
@@ -1161,10 +1164,11 @@ async function handleDecode(payload: DecodeRequest) {
       const decodedTiff = decodeTiff(payload.buffer);
       decodedCanvas = decodedTiff.canvas;
       exif = decodedTiff.orientation ? { orientation: decodedTiff.orientation } : undefined;
-      const identified = identifyIccProfile(decodedTiff.iccProfile);
+      const identified = parseInputIccProfile(decodedTiff.iccProfile);
       embeddedColorProfileName = identified.profileName;
       embeddedColorProfileId = identified.profileId;
-      unsupportedColorProfileName = identified.profileId ? null : (decodedTiff.iccProfile ? 'Embedded ICC profile' : null);
+      embeddedParsedProfile = identified.parsedProfile;
+      unsupportedColorProfileName = identified.profileId || identified.parsedProfile ? null : (decodedTiff.iccProfile ? 'Embedded ICC profile' : null);
     } else {
       decodedCanvas = await decodeRasterBlob(payload.buffer, payload.mime);
       const isJpeg = extension === '.jpg' || extension === '.jpeg' || payload.mime === 'image/jpeg';
@@ -1172,6 +1176,7 @@ async function handleDecode(payload: DecodeRequest) {
       const extractedProfile = extractRasterColorProfile(payload.buffer, payload.mime, extension);
       embeddedColorProfileName = extractedProfile.profileName;
       embeddedColorProfileId = extractedProfile.profileId;
+      embeddedParsedProfile = extractedProfile.parsedProfile;
       unsupportedColorProfileName = extractedProfile.unsupportedProfileName;
     }
   } catch (error) {
@@ -1205,6 +1210,7 @@ async function handleDecode(payload: DecodeRequest) {
     ...(exif ? { exif } : {}),
     ...(embeddedColorProfileName ? { embeddedColorProfileName } : {}),
     ...(embeddedColorProfileId ? { embeddedColorProfileId } : {}),
+    ...(embeddedParsedProfile ? { embeddedParsedProfile } : {}),
     ...(payload.declaredColorProfileName ? { decoderColorProfileName: payload.declaredColorProfileName } : {}),
     ...(decoderColorProfileId ? { decoderColorProfileId } : {}),
     ...((unsupportedColorProfileName ?? declaredUnsupportedColorProfileName) ? { unsupportedColorProfileName: unsupportedColorProfileName ?? declaredUnsupportedColorProfileName } : {}),

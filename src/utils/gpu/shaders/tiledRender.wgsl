@@ -144,10 +144,13 @@ fn clampF(value: f32, minValue: f32, maxValue: f32) -> f32 {
   return max(minValue, min(maxValue, value));
 }
 
+// Transfer mode encoding (mirrors getTransferMode in colorProfiles.ts):
+// 0 = sRGB piecewise curve, any positive value = pure gamma with that exponent
+// (1.0 = linear, 2.19921875 = Adobe RGB, scanner profiles as parsed).
 fn decodeTransfer(value: f32, mode: f32) -> f32 {
   let normalized = clampF(value, 0.0, 1.0);
-  if (mode > 0.5) {
-    return pow(normalized, 2.19921875);
+  if (mode > 0.0) {
+    return pow(normalized, mode);
   }
   if (normalized <= 0.04045) {
     return normalized / 12.92;
@@ -157,8 +160,8 @@ fn decodeTransfer(value: f32, mode: f32) -> f32 {
 
 fn encodeTransfer(value: f32, mode: f32) -> f32 {
   let normalized = clampF(value, 0.0, 1.0);
-  if (mode > 0.5) {
-    return pow(normalized, 1.0 / 2.19921875);
+  if (mode > 0.0) {
+    return pow(normalized, 1.0 / mode);
   }
   if (normalized <= 0.0031308) {
     return normalized * 12.92;

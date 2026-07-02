@@ -3,14 +3,14 @@ import { motion, AnimatePresence } from 'motion/react';
 import { X, Copy, Check, ExternalLink, FolderOpen, Settings2, Bell, Palette, Keyboard, Activity, Download, RefreshCw, Grid3x3, Trash2, Upload } from 'lucide-react';
 import { ColorManagementSettings, ColorProfileId, ExportOptions, FilmProfile, LabStyleProfile, LightSourceProfile, NotificationSettings, RenderBackendDiagnostics, SourceMetadata, UpdateChannel } from '../types';
 import { APP_VERSION_LABEL } from '../appVersion';
-import { getColorProfileDescription } from '../utils/colorProfiles';
+import { getColorProfileDescription, getInputProfileLabel } from '../utils/colorProfiles';
 import { isDesktopShell } from '../utils/fileBridge';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { useModalA11y } from '../hooks/useModalA11y';
 import { MAX_RESIDENT_DOC_OPTIONS, MaxResidentDocs } from '../utils/residentDocsStore';
 import { AUTO_APPLY_NONE_PRESET_ID } from '../utils/preferenceStore';
 
-const COLOR_PROFILE_IDS: ColorProfileId[] = ['srgb', 'display-p3', 'adobe-rgb'];
+const COLOR_PROFILE_IDS: ColorProfileId[] = ['srgb', 'display-p3', 'adobe-rgb', 'linear'];
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -303,16 +303,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const autoInputLabel = (() => {
     if (sourceMetadata?.decoderColorProfileId) return getColorProfileDescription(sourceMetadata.decoderColorProfileId);
     if (sourceMetadata?.embeddedColorProfileId) return getColorProfileDescription(sourceMetadata.embeddedColorProfileId);
+    if (sourceMetadata?.embeddedParsedProfile) return getInputProfileLabel(sourceMetadata.embeddedParsedProfile);
     return 'sRGB';
   })();
 
   const colorManagementHelper = (() => {
-    if (sourceMetadata?.unsupportedColorProfileName) {
-      return `Unsupported source profile "${sourceMetadata.unsupportedColorProfileName}". Auto is using sRGB.`;
-    }
     if (sourceMetadata?.decoderColorProfileName) return `Using decoder-reported color space: ${autoInputLabel}`;
     if (sourceMetadata?.embeddedColorProfileName && sourceMetadata.embeddedColorProfileId) {
       return `Using embedded profile: ${autoInputLabel}`;
+    }
+    if (sourceMetadata?.embeddedParsedProfile) {
+      return `Using parsed embedded profile: ${autoInputLabel}`;
+    }
+    if (sourceMetadata?.unsupportedColorProfileName) {
+      return `Unsupported source profile "${sourceMetadata.unsupportedColorProfileName}". Auto is using sRGB.`;
     }
     return `No source profile detected. Auto is using ${autoInputLabel}.`;
   })();
