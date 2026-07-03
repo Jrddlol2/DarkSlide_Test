@@ -91,6 +91,7 @@ export function resolveDustRemovalSettings(dustRemoval?: Partial<DustRemovalSett
 
 export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
   format: 'image/jpeg',
+  bitDepth: 8,
   quality: 0.92,
   filenameBase: 'darkslide-converted',
   embedMetadata: true,
@@ -105,6 +106,7 @@ export const BUILTIN_QUICK_EXPORT_PRESETS: QuickExportPreset[] = [
     id: 'quick-web',
     name: 'Web',
     format: 'image/jpeg',
+    bitDepth: 8,
     quality: 0.85,
     outputProfileId: 'srgb',
     embedMetadata: true,
@@ -119,6 +121,7 @@ export const BUILTIN_QUICK_EXPORT_PRESETS: QuickExportPreset[] = [
     id: 'quick-archive',
     name: 'Archive',
     format: 'image/tiff',
+    bitDepth: 8,
     quality: 1,
     outputProfileId: 'adobe-rgb',
     embedMetadata: true,
@@ -133,6 +136,7 @@ export const BUILTIN_QUICK_EXPORT_PRESETS: QuickExportPreset[] = [
     id: 'quick-instagram',
     name: 'Instagram',
     format: 'image/jpeg',
+    bitDepth: 8,
     quality: 0.9,
     outputProfileId: 'srgb',
     embedMetadata: false,
@@ -147,6 +151,7 @@ export const BUILTIN_QUICK_EXPORT_PRESETS: QuickExportPreset[] = [
     id: 'quick-print',
     name: 'Print',
     format: 'image/tiff',
+    bitDepth: 8,
     quality: 1,
     outputProfileId: 'adobe-rgb',
     embedMetadata: true,
@@ -410,6 +415,14 @@ export const FILM_STOCK_DENSITY_PRESETS: Record<string, Omit<DensityBalance, 'so
   'pro-160ns': { scaleR: 1, scaleG: 1, scaleB: 0.54 },
   'fujifilm-200': { scaleR: 1, scaleG: 1, scaleB: 0.57 },
 };
+
+// Effective display gamma of the density → positive mapping. Calibrated so a
+// typical C-41 midtone lands where the previous complement inversion put it,
+// which keeps existing film profile defaults and user presets working.
+// Per-channel dye contrast differences are handled by the density balance
+// scales above (FILM_STOCK_DENSITY_PRESETS / computeDensityBalance), so this
+// stays a single scalar — applying both would double-correct.
+export const DENSITY_TO_POSITIVE_GAMMA = 2.2;
 
 export const LIGHT_SOURCE_PROFILES: LightSourceProfile[] = [
   { id: 'auto', name: 'Auto (no correction)', colorTemperature: 0, spectralBias: [1, 1, 1], flareCharacteristic: 'medium' },

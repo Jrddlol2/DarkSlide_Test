@@ -3,14 +3,14 @@ import { motion, AnimatePresence } from 'motion/react';
 import { X, Copy, Check, ExternalLink, FolderOpen, Settings2, Bell, Palette, Keyboard, Activity, Download, RefreshCw, Grid3x3, Trash2, Upload } from 'lucide-react';
 import { ColorManagementSettings, ColorProfileId, ExportOptions, FilmProfile, LabStyleProfile, LightSourceProfile, NotificationSettings, RenderBackendDiagnostics, SourceMetadata, UpdateChannel } from '../types';
 import { APP_VERSION_LABEL } from '../appVersion';
-import { getColorProfileDescription } from '../utils/colorProfiles';
+import { getColorProfileDescription, getInputProfileLabel } from '../utils/colorProfiles';
 import { isDesktopShell } from '../utils/fileBridge';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { useModalA11y } from '../hooks/useModalA11y';
 import { MAX_RESIDENT_DOC_OPTIONS, MaxResidentDocs } from '../utils/residentDocsStore';
 import { AUTO_APPLY_NONE_PRESET_ID } from '../utils/preferenceStore';
 
-const COLOR_PROFILE_IDS: ColorProfileId[] = ['srgb', 'display-p3', 'adobe-rgb'];
+const COLOR_PROFILE_IDS: ColorProfileId[] = ['srgb', 'display-p3', 'adobe-rgb', 'linear'];
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -303,16 +303,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const autoInputLabel = (() => {
     if (sourceMetadata?.decoderColorProfileId) return getColorProfileDescription(sourceMetadata.decoderColorProfileId);
     if (sourceMetadata?.embeddedColorProfileId) return getColorProfileDescription(sourceMetadata.embeddedColorProfileId);
+    if (sourceMetadata?.embeddedParsedProfile) return getInputProfileLabel(sourceMetadata.embeddedParsedProfile);
     return 'sRGB';
   })();
 
   const colorManagementHelper = (() => {
-    if (sourceMetadata?.unsupportedColorProfileName) {
-      return `Unsupported source profile "${sourceMetadata.unsupportedColorProfileName}". Auto is using sRGB.`;
-    }
     if (sourceMetadata?.decoderColorProfileName) return `Using decoder-reported color space: ${autoInputLabel}`;
     if (sourceMetadata?.embeddedColorProfileName && sourceMetadata.embeddedColorProfileId) {
       return `Using embedded profile: ${autoInputLabel}`;
+    }
+    if (sourceMetadata?.embeddedParsedProfile) {
+      return `Using parsed embedded profile: ${autoInputLabel}`;
+    }
+    if (sourceMetadata?.unsupportedColorProfileName) {
+      return `Unsupported source profile "${sourceMetadata.unsupportedColorProfileName}". Auto is using sRGB.`;
     }
     return `No source profile detected. Auto is using ${autoInputLabel}.`;
   })();
@@ -622,6 +626,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             ))}
                           </div>
                         </div>
+
+                        {(exportOptions.format === 'image/png' || exportOptions.format === 'image/tiff') && (
+                          <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 space-y-3">
+                            <div>
+                              <p className="text-[13px] font-semibold text-zinc-100">Bit Depth</p>
+                              <p className="mt-0.5 text-[12px] leading-relaxed text-zinc-500">
+                                Use 16-bit for archive files that will be edited further.
+                              </p>
+                            </div>
+                            <div className="grid grid-cols-2 gap-1 rounded-lg bg-zinc-950 p-1">
+                              {([8, 16] as const).map((bitDepth) => (
+                                <button
+                                  key={bitDepth}
+                                  type="button"
+                                  onClick={() => onExportOptionsChange({ bitDepth })}
+                                  className={`rounded-md px-3 py-2 text-[13px] font-medium transition-all ${
+                                    exportOptions.bitDepth === bitDepth
+                                      ? 'bg-emerald-500/15 text-emerald-200'
+                                      : 'text-zinc-500 hover:text-zinc-300'
+                                  }`}
+                                >
+                                  {bitDepth}-bit
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
 
                         {/* Quality */}
                         {showQuality && (

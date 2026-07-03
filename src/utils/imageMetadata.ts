@@ -1,6 +1,6 @@
 import piexif from 'piexifjs';
-import { ColorProfileId, ExifMetadata, ExportOptions, ExportResult } from '../types';
-import { getColorProfileDescription, getColorProfileIcc, identifyIccProfile } from './colorProfiles';
+import { ColorProfileId, ExifMetadata, ExportOptions, ExportResult, ParsedInputProfile } from '../types';
+import { getColorProfileDescription, getColorProfileIcc, identifyIccProfile, parseInputIccProfile } from './colorProfiles';
 import { embedIccInBlob } from './iccEmbed';
 
 const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -232,7 +232,12 @@ export function extractRasterColorProfile(
   buffer: ArrayBuffer,
   mime: string,
   extension: string,
-): { profileId: ColorProfileId | null; profileName: string | null; unsupportedProfileName: string | null } {
+): {
+  profileId: ColorProfileId | null;
+  parsedProfile: ParsedInputProfile | null;
+  profileName: string | null;
+  unsupportedProfileName: string | null;
+} {
   const bytes = new Uint8Array(buffer);
   const normalizedMime = mime.toLowerCase();
   const normalizedExtension = extension.toLowerCase();
@@ -247,11 +252,15 @@ export function extractRasterColorProfile(
     iccProfile = extractWebpIccProfile(bytes);
   }
 
-  const identified = identifyIccProfile(iccProfile, profileName);
+  const parsed = iccProfile ? parseInputIccProfile(iccProfile) : null;
+  const identified = parsed ?? identifyIccProfile(iccProfile, profileName);
   return {
     profileId: identified.profileId,
+    parsedProfile: parsed?.parsedProfile ?? null,
     profileName: identified.profileName ?? profileName,
-    unsupportedProfileName: identified.profileId ? null : (profileName ?? (iccProfile ? 'Embedded ICC profile' : null)),
+    unsupportedProfileName: identified.profileId || parsed?.parsedProfile
+      ? null
+      : (profileName ?? (iccProfile ? 'Embedded ICC profile' : null)),
   };
 }
 

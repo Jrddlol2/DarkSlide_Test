@@ -8,6 +8,9 @@ import {
   CancelTileJobRequest,
   ContactSheetRequest,
   ContactSheetResult,
+  ConversionAnalysisRequest,
+  ConversionAnalysisResult,
+  ConversionParametersDebug,
   ConversionSettings,
   DecodeRequest,
   DensityBalance,
@@ -17,7 +20,9 @@ import {
   ExportResult,
   FilmBaseSample,
   FilmProfileType,
+  InputProfileSpec,
   PreparePreviewBitmapRequest,
+  ParsedInputProfile,
   PreparedPreviewBitmapResult,
   PreparedTileJobResult,
   PreviewLevel,
@@ -33,8 +38,7 @@ import {
   WorkerMemoryDiagnostics,
 } from '../types';
 import {
-  applyFilmBaseCompensation,
-  applyLightSourceCorrection,
+  applyInversionStage,
   assertSupportedDimensions,
   buildEmptyHistogram,
   computeResidualBaseOffset,
@@ -48,13 +52,14 @@ import {
   normalizeCrop,
   processImageData,
   releaseScratchBuffers,
+  resolveDensityInversionParams,
   sanitizeFilenameBase,
   selectPreviewLevel,
 } from './imagePipeline';
 import { analyzeChannelFloors, analyzeColorBalance, analyzeExposure, analyzeMidtoneContrast } from './autoAnalysis';
 import { MAX_FILE_SIZE_BYTES, PREVIEW_LEVELS, RAW_EXTENSIONS, resolveDustRemovalSettings } from '../constants';
 import { decodeTiffRaster, TiffDecodeError } from './tiff';
-import { convertImageDataColorProfile, getColorProfileIdFromName, identifyIccProfile } from './colorProfiles';
+import { convertImageDataColorProfile, getColorProfileIdFromName, parseInputIccProfile } from './colorProfiles';
 import { extractExifMetadata, extractRasterColorProfile } from './imageMetadata';
 import { detectDustMarks } from './dustDetection';
 import { detectFrame } from './frameDetection';
@@ -65,9 +70,9 @@ import {
   prepareGeometryCacheEntry,
 } from './workerGeometryCache';
 import { clamp } from './math';
-import { estimateFilmBaseSampleFromRgba } from './rawImport';
-import { FULL_FRAME_CROP, isFullFrameCrop } from './batchSettings';
+import { estimateFilmBaseSampleFromRgba, mirrorFromExifOrientation } from './rawImport';
 import { usesColorChannelPipeline } from './pipelineIntent';
+import { encodeExportRaster } from './exportEncoder';
 import {
   WorkerError,
   WorkerMessage,
@@ -88,8 +93,16 @@ interface StoredDocument {
   cropCache: Map<string, StoredTileJob>;
   estimatedFilmBaseSample: FilmBaseSample | null;
   estimatedDensityBalance: DensityBalance | null;
+  // Pinned conversion analysis (audit Phase C): memoized so preview, tiles,
+  // dust detection, and export all consume identical numbers.
+  residualBaseCache: Map<string, [number, number, number] | null>;
+  highlightDensityCache: Map<string, number>;
   lastAccessedAt: number;
 }
+
+const ANALYSIS_CACHE_LIMIT = 16;
+const RESIDUAL_ANALYSIS_MAX_DIMENSION = 1024;
+const HIGHLIGHT_ANALYSIS_MAX_DIMENSION = 512;
 
 interface StoredTileJob {
   documentId: string;
@@ -178,6 +191,17 @@ function isRecentlyCancelledJob(jobId: string) {
   return cancelledJobs.has(jobId);
 }
 
+function mirrorCanvasHorizontal(source: OffscreenCanvas) {
+  const canvas = new OffscreenCanvas(source.width, source.height);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('Could not create mirror canvas.');
+  ctx.translate(source.width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(source, 0, 0);
+  releaseCanvas(source);
+  return canvas;
+}
+
 async function decodeRasterBlob(buffer: ArrayBuffer, mime: string) {
   const blob = new Blob([buffer], { type: mime || 'image/png' });
   const bitmap = await createImageBitmap(blob, { imageOrientation: 'none' });
@@ -237,28 +261,6 @@ function buildPreviewCanvas(source: OffscreenCanvas, maxDimension: number) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) throw new Error('Could not create preview canvas.');
   ctx.drawImage(source, 0, 0, width, height);
-  return canvas;
-}
-
-function resizeCanvasForExport(source: OffscreenCanvas, targetMaxDimension: number | null) {
-  if (!targetMaxDimension) {
-    return source;
-  }
-
-  const longestEdge = Math.max(source.width, source.height);
-  if (targetMaxDimension >= longestEdge) {
-    return source;
-  }
-
-  const scale = targetMaxDimension / longestEdge;
-  const width = Math.max(1, Math.round(source.width * scale));
-  const height = Math.max(1, Math.round(source.height * scale));
-  const canvas = new OffscreenCanvas(width, height);
-  const context = canvas.getContext('2d', { willReadFrequently: true });
-  if (!context) {
-    throw new Error('Could not resize export canvas.');
-  }
-  context.drawImage(source, 0, 0, width, height);
   return canvas;
 }
 
@@ -361,45 +363,206 @@ function renderTransformedCanvas(sourceCanvas: OffscreenCanvas, settings: Conver
   };
 }
 
-function getResidualBaseSamplingSettings(settings: ConversionSettings) {
-  const normalizedCrop = normalizeCrop(settings);
-  if (isFullFrameCrop(normalizedCrop)) {
-    return settings;
+function rememberAnalysisResult<T>(cache: Map<string, T>, key: string, value: T) {
+  if (cache.size >= ANALYSIS_CACHE_LIMIT) {
+    cache.clear();
   }
-
-  return {
-    ...settings,
-    crop: { ...FULL_FRAME_CROP },
-  };
+  cache.set(key, value);
+  return value;
 }
 
-function computeResidualBaseOffsetForSourceCanvas(
-  sourceCanvas: OffscreenCanvas,
+// Pinned residual-base analysis: always computed on the untransformed
+// 1024px analysis preview so preview, tiles, dust detection, and export
+// receive identical numbers regardless of the resolution being rendered.
+function getPinnedResidualBaseOffset(
+  document: StoredDocument,
   settings: ConversionSettings,
   isColor: boolean,
   filmType: FilmProfileType = 'negative',
-  inputProfileId: ColorProfileId = 'srgb',
+  inputProfileId: InputProfileSpec = 'srgb',
   outputProfileId: ColorProfileId = 'srgb',
   lightSourceBias: [number, number, number] = [1, 1, 1],
   flareFloor: [number, number, number] | null = null,
+  profileId: string | null = null,
 ) {
-  const samplingSettings = getResidualBaseSamplingSettings(settings);
-  const transformed = renderTransformedCanvas(sourceCanvas, samplingSettings);
-  const context = transformed.canvas.getContext('2d', { willReadFrequently: true });
-  if (!context) {
-    throw new Error('Could not read residual base analysis canvas.');
+  if (!isColor || filmType !== 'negative' || settings.residualBaseCorrection === false) {
+    return null;
   }
 
-  return computeResidualBaseOffset(
-    context.getImageData(0, 0, transformed.width, transformed.height),
-    samplingSettings,
+  const cacheKey = JSON.stringify([
+    settings.filmBaseSample,
+    settings.flareCorrection ?? 50,
     isColor,
     filmType,
     inputProfileId,
     outputProfileId,
     lightSourceBias,
     flareFloor,
+    profileId,
+  ]);
+  const cached = document.residualBaseCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const preview = getOrCreatePreviewByMaxDimension(document, RESIDUAL_ANALYSIS_MAX_DIMENSION);
+  const context = preview.canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) {
+    throw new Error('Could not read residual base analysis canvas.');
+  }
+
+  const offset = computeResidualBaseOffset(
+    context.getImageData(0, 0, preview.canvas.width, preview.canvas.height),
+    settings,
+    isColor,
+    filmType,
+    inputProfileId,
+    outputProfileId,
+    lightSourceBias,
+    flareFloor,
+    profileId,
+    document.estimatedFilmBaseSample,
+    document.estimatedDensityBalance,
   );
+
+  return rememberAnalysisResult(document.residualBaseCache, cacheKey, offset);
+}
+
+// Pinned highlight-density analysis: replaces the previous feedback loop
+// where each render consumed the highlight share of the *previous* preview
+// histogram and export approximated with a stale value. Measured at a fixed
+// 512px with highlight protection disabled, so preview and export agree.
+function getPinnedHighlightDensity(
+  document: StoredDocument,
+  payload: Omit<ConversionAnalysisRequest, 'documentId'>,
+  residualBaseOffset: [number, number, number] | null,
+) {
+  // The analysis neutralizes highlightProtection, sharpen, and noiseReduction
+  // before measuring, so key the cache on the neutralized settings — otherwise
+  // nudging those sliders busts the (clear-all-eviction) cache and recomputes an
+  // identical result.
+  const analysisSettings: ConversionSettings = {
+    ...payload.settings,
+    highlightProtection: 0,
+    sharpen: { ...payload.settings.sharpen, enabled: false },
+    noiseReduction: { ...payload.settings.noiseReduction, enabled: false },
+  };
+  const cacheKey = JSON.stringify([
+    analysisSettings,
+    payload.isColor,
+    payload.profileId ?? null,
+    payload.filmType ?? 'negative',
+    payload.inputProfileId ?? 'srgb',
+    payload.outputProfileId ?? 'srgb',
+    payload.lightSourceBias ?? null,
+    payload.flareFloor ?? null,
+    payload.maskTuning ?? null,
+    payload.colorMatrix ?? null,
+    payload.tonalCharacter ?? null,
+    payload.labStyleToneCurve ?? null,
+    payload.labStyleChannelCurves ?? null,
+    payload.labTonalCharacterOverride ?? null,
+    payload.labSaturationBias ?? 0,
+    payload.labTemperatureBias ?? 0,
+  ]);
+  const cached = document.highlightDensityCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const preview = getOrCreatePreviewByMaxDimension(document, HIGHLIGHT_ANALYSIS_MAX_DIMENSION);
+  // Use job-local canvases: the shared renderTransformedCanvas output may
+  // still be in use by the render/export that requested this analysis.
+  const rotatedCanvas = renderRotatedCanvasForJob(preview.canvas, analysisSettings);
+  const transformed = renderCroppedCanvasForJob(rotatedCanvas, analysisSettings);
+  releaseCanvas(rotatedCanvas);
+  const context = transformed.canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) {
+    throw new Error('Could not read highlight analysis canvas.');
+  }
+  const analysisImageData = context.getImageData(0, 0, transformed.width, transformed.height);
+  releaseCanvas(transformed.canvas);
+
+  const histogram = processImageData(
+    analysisImageData,
+    analysisSettings,
+    payload.isColor,
+    'processed',
+    payload.maskTuning,
+    payload.colorMatrix,
+    payload.tonalCharacter,
+    payload.labStyleToneCurve,
+    payload.labStyleChannelCurves,
+    payload.labTonalCharacterOverride,
+    payload.labSaturationBias ?? 0,
+    payload.labTemperatureBias ?? 0,
+    0,
+    payload.inputProfileId ?? 'srgb',
+    payload.outputProfileId ?? 'srgb',
+    payload.profileId ?? null,
+    payload.filmType ?? 'negative',
+    residualBaseOffset,
+    payload.flareFloor ?? null,
+    payload.lightSourceBias ?? [1, 1, 1],
+    document.estimatedFilmBaseSample,
+    document.estimatedDensityBalance,
+  );
+
+  return rememberAnalysisResult(document.highlightDensityCache, cacheKey, computeHighlightDensity(histogram));
+}
+
+function buildConversionParametersDebug(
+  document: StoredDocument,
+  payload: Omit<ConversionAnalysisRequest, 'documentId'>,
+  residualBaseOffset: [number, number, number] | null,
+  highlightDensity: number,
+): ConversionParametersDebug {
+  const densityInversion = resolveDensityInversionParams(
+    payload.settings,
+    payload.isColor,
+    payload.filmType ?? 'negative',
+    payload.profileId ?? null,
+    document.estimatedFilmBaseSample,
+    document.estimatedDensityBalance,
+    payload.inputProfileId ?? 'srgb',
+    payload.outputProfileId ?? 'srgb',
+    payload.flareFloor ?? null,
+    (payload.settings.flareCorrection ?? 50) / 100,
+  );
+
+  return {
+    baseSampleSource: densityInversion.baseSampleSource,
+    baseDensity: densityInversion.baseDensity,
+    densityScale: densityInversion.densityScale,
+    densityScaleSource: densityInversion.densityScaleSource,
+    inputProfileId: payload.inputProfileId ?? 'srgb',
+    outputProfileId: payload.outputProfileId ?? 'srgb',
+    flareFloor: payload.flareFloor ?? null,
+    residualBaseOffset,
+    highlightDensity,
+  };
+}
+
+function handleConversionAnalysis(payload: ConversionAnalysisRequest): ConversionAnalysisResult {
+  const document = getStoredDocument(payload.documentId);
+  const residualBaseOffset = getPinnedResidualBaseOffset(
+    document,
+    payload.settings,
+    payload.isColor,
+    payload.filmType ?? 'negative',
+    payload.inputProfileId ?? 'srgb',
+    payload.outputProfileId ?? 'srgb',
+    payload.lightSourceBias ?? [1, 1, 1],
+    payload.flareFloor ?? null,
+    payload.profileId ?? null,
+  );
+  const highlightDensity = getPinnedHighlightDensity(document, payload, residualBaseOffset);
+
+  return {
+    type: 'conversion-analysis',
+    residualBaseOffset,
+    highlightDensity,
+    debug: buildConversionParametersDebug(document, payload, residualBaseOffset, highlightDensity),
+  };
 }
 
 function renderRotatedCanvasForJob(sourceCanvas: OffscreenCanvas, settings: ConversionSettings) {
@@ -459,12 +622,12 @@ function getStoredDocument(documentId: string) {
   return document;
 }
 
-function resolveStoredInputProfileId(document: StoredDocument, inputMode: 'auto' | 'override', inputProfileId: ColorProfileId) {
+function resolveStoredInputProfileId(document: StoredDocument, inputMode: 'auto' | 'override', inputProfileId: ColorProfileId): InputProfileSpec {
   if (inputMode === 'override') {
     return inputProfileId;
   }
 
-  return document.metadata.decoderColorProfileId ?? document.metadata.embeddedColorProfileId ?? 'srgb';
+  return document.metadata.decoderColorProfileId ?? document.metadata.embeddedColorProfileId ?? document.metadata.embeddedParsedProfile ?? 'srgb';
 }
 
 function getHalo(settings: ConversionSettings, comparisonMode: 'processed' | 'original') {
@@ -782,42 +945,71 @@ function createDustRemovedCanvas(sourceCanvas: OffscreenCanvas, settings: Conver
   return canvas;
 }
 
-function applyDustAnalysisStage(
+interface AnalysisInversionOptions {
+  settings: ConversionSettings;
+  isColor: boolean;
+  profileId?: string | null;
+  filmType?: FilmProfileType;
+  flareFloor?: [number, number, number] | null;
+  lightSourceBias?: [number, number, number];
+}
+
+// Shared front-half of the conversion pipeline for analysis passes (auto
+// white balance, dust detection). Mirrors processImageData up to the
+// channel-balance stage so analysis sees the same positives as rendering.
+function applyAnalysisInversionStage(
   imageData: ImageData,
-  payload: DustDetectRequest,
+  options: AnalysisInversionOptions,
+  inputProfileId: InputProfileSpec,
+  outputProfileId: ColorProfileId,
+  document: StoredDocument,
   residualBaseOffset: [number, number, number] | null,
 ) {
-  convertImageDataColorProfile(imageData, 'srgb', 'srgb');
+  convertImageDataColorProfile(imageData, inputProfileId, outputProfileId);
 
   const { data } = imageData;
-  const filmBaseBalance = getFilmBaseBalance(payload.settings.filmBaseSample);
-  const lightSourceBias = payload.lightSourceBias ?? [1, 1, 1];
-  const filmType = payload.filmType ?? 'negative';
+  const filmType = options.filmType ?? 'negative';
+  const filmBaseBalance = getFilmBaseBalance(options.settings.filmBaseSample);
+  const lightSourceBias = options.lightSourceBias ?? [1, 1, 1];
+  const flareStrength = (options.settings.flareCorrection ?? 50) / 100;
+  const flareFloorNormalized: [number, number, number] = options.flareFloor
+    ? [options.flareFloor[0] / 255, options.flareFloor[1] / 255, options.flareFloor[2] / 255]
+    : [0, 0, 0];
+  const densityInversion = resolveDensityInversionParams(
+    options.settings,
+    options.isColor,
+    filmType,
+    options.profileId ?? null,
+    document.estimatedFilmBaseSample,
+    document.estimatedDensityBalance,
+    inputProfileId,
+    outputProfileId,
+    options.flareFloor ?? null,
+    flareStrength,
+  );
 
   for (let index = 0; index < data.length; index += 4) {
     let r = data[index] / 255;
     let g = data[index + 1] / 255;
     let b = data[index + 2] / 255;
 
-    r = applyLightSourceCorrection(r, lightSourceBias[0]);
-    g = applyLightSourceCorrection(g, lightSourceBias[1]);
-    b = applyLightSourceCorrection(b, lightSourceBias[2]);
+    [r, g, b] = applyInversionStage(
+      r,
+      g,
+      b,
+      filmType,
+      outputProfileId,
+      filmBaseBalance,
+      densityInversion,
+      flareFloorNormalized,
+      flareStrength,
+      lightSourceBias,
+      residualBaseOffset,
+    );
 
-    if (filmType !== 'slide') {
-      r = 1 - r;
-      g = 1 - g;
-      b = 1 - b;
-    }
-
-    r = applyFilmBaseCompensation(r, filmBaseBalance.red) * payload.settings.redBalance;
-    g = applyFilmBaseCompensation(g, filmBaseBalance.green) * payload.settings.greenBalance;
-    b = applyFilmBaseCompensation(b, filmBaseBalance.blue) * payload.settings.blueBalance;
-
-    if (residualBaseOffset) {
-      r = Math.max(0, r - residualBaseOffset[0]);
-      g = Math.max(0, g - residualBaseOffset[1]);
-      b = Math.max(0, b - residualBaseOffset[2]);
-    }
+    r *= options.settings.redBalance;
+    g *= options.settings.greenBalance;
+    b *= options.settings.blueBalance;
 
     data[index] = clamp(Math.round(clamp(r, 0, 1) * 255), 0, 255);
     data[index + 1] = clamp(Math.round(clamp(g, 0, 1) * 255), 0, 255);
@@ -837,8 +1029,8 @@ function handleDustDetect(payload: DustDetectRequest) {
   }
 
   const imageData = context.getImageData(0, 0, transformed.width, transformed.height);
-  const residualBaseOffset = computeResidualBaseOffsetForSourceCanvas(
-    preview.canvas,
+  const residualBaseOffset = getPinnedResidualBaseOffset(
+    document,
     payload.settings,
     payload.isColor,
     payload.filmType ?? 'negative',
@@ -846,10 +1038,14 @@ function handleDustDetect(payload: DustDetectRequest) {
     'srgb',
     payload.lightSourceBias ?? [1, 1, 1],
     payload.flareFloor ?? null,
+    payload.profileId ?? null,
   );
-  applyDustAnalysisStage(
+  applyAnalysisInversionStage(
     imageData,
     payload,
+    'srgb',
+    'srgb',
+    document,
     residualBaseOffset,
   );
   const detectedMarks = detectDustMarks(imageData, payload.sensitivity, payload.maxRadius, payload.mode)
@@ -873,7 +1069,7 @@ async function handleDecode(payload: DecodeRequest) {
     }
 
     const { width, height } = payload.rawDimensions;
-    const canvas = new OffscreenCanvas(width, height);
+    let canvas = new OffscreenCanvas(width, height);
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) {
       throw new Error('Could not create RAW decode canvas.');
@@ -881,6 +1077,10 @@ async function handleDecode(payload: DecodeRequest) {
 
     const imageData = new ImageData(new Uint8ClampedArray(payload.buffer), width, height);
     ctx.putImageData(imageData, 0, 0);
+
+    if (payload.mirrorHorizontal) {
+      canvas = mirrorCanvasHorizontal(canvas);
+    }
 
     assertSupportedDimensions(canvas.width, canvas.height);
 
@@ -903,6 +1103,8 @@ async function handleDecode(payload: DecodeRequest) {
       previews: previewStore,
       rotationCache: new Map(),
       cropCache: new Map(),
+      residualBaseCache: new Map(),
+      highlightDensityCache: new Map(),
       estimatedFilmBaseSample,
       estimatedDensityBalance,
       lastAccessedAt: Date.now(),
@@ -936,6 +1138,7 @@ async function handleDecode(payload: DecodeRequest) {
   let exif: SourceMetadata['exif'];
   let embeddedColorProfileName: string | null = null;
   let embeddedColorProfileId: ColorProfileId | null = null;
+  let embeddedParsedProfile: ParsedInputProfile | null = null;
   let unsupportedColorProfileName: string | null = null;
 
   try {
@@ -943,10 +1146,11 @@ async function handleDecode(payload: DecodeRequest) {
       const decodedTiff = decodeTiff(payload.buffer);
       decodedCanvas = decodedTiff.canvas;
       exif = decodedTiff.orientation ? { orientation: decodedTiff.orientation } : undefined;
-      const identified = identifyIccProfile(decodedTiff.iccProfile);
+      const identified = parseInputIccProfile(decodedTiff.iccProfile);
       embeddedColorProfileName = identified.profileName;
       embeddedColorProfileId = identified.profileId;
-      unsupportedColorProfileName = identified.profileId ? null : (decodedTiff.iccProfile ? 'Embedded ICC profile' : null);
+      embeddedParsedProfile = identified.parsedProfile;
+      unsupportedColorProfileName = identified.profileId || identified.parsedProfile ? null : (decodedTiff.iccProfile ? 'Embedded ICC profile' : null);
     } else {
       decodedCanvas = await decodeRasterBlob(payload.buffer, payload.mime);
       const isJpeg = extension === '.jpg' || extension === '.jpeg' || payload.mime === 'image/jpeg';
@@ -954,6 +1158,7 @@ async function handleDecode(payload: DecodeRequest) {
       const extractedProfile = extractRasterColorProfile(payload.buffer, payload.mime, extension);
       embeddedColorProfileName = extractedProfile.profileName;
       embeddedColorProfileId = extractedProfile.profileId;
+      embeddedParsedProfile = extractedProfile.parsedProfile;
       unsupportedColorProfileName = extractedProfile.unsupportedProfileName;
     }
   } catch (error) {
@@ -961,6 +1166,10 @@ async function handleDecode(payload: DecodeRequest) {
       throw createError(error.code, error.message);
     }
     throw error;
+  }
+
+  if (mirrorFromExifOrientation(exif?.orientation)) {
+    decodedCanvas = mirrorCanvasHorizontal(decodedCanvas);
   }
 
   assertSupportedDimensions(decodedCanvas.width, decodedCanvas.height);
@@ -983,6 +1192,7 @@ async function handleDecode(payload: DecodeRequest) {
     ...(exif ? { exif } : {}),
     ...(embeddedColorProfileName ? { embeddedColorProfileName } : {}),
     ...(embeddedColorProfileId ? { embeddedColorProfileId } : {}),
+    ...(embeddedParsedProfile ? { embeddedParsedProfile } : {}),
     ...(payload.declaredColorProfileName ? { decoderColorProfileName: payload.declaredColorProfileName } : {}),
     ...(decoderColorProfileId ? { decoderColorProfileId } : {}),
     ...((unsupportedColorProfileName ?? declaredUnsupportedColorProfileName) ? { unsupportedColorProfileName: unsupportedColorProfileName ?? declaredUnsupportedColorProfileName } : {}),
@@ -994,6 +1204,8 @@ async function handleDecode(payload: DecodeRequest) {
     previews: previewStore,
     rotationCache: new Map(),
     cropCache: new Map(),
+    residualBaseCache: new Map(),
+    highlightDensityCache: new Map(),
     estimatedFilmBaseSample,
     estimatedDensityBalance,
     lastAccessedAt: Date.now(),
@@ -1178,49 +1390,6 @@ function sampleRegionFromTransformedCanvas(
   } satisfies FilmBaseSample;
 }
 
-function applyAutoWhiteBalanceAnalysisStage(
-  imageData: ImageData,
-  payload: AutoAnalyzeRequest,
-  residualBaseOffset: [number, number, number] | null,
-) {
-  convertImageDataColorProfile(imageData, payload.inputProfileId ?? 'srgb', payload.outputProfileId ?? 'srgb');
-
-  const { data } = imageData;
-  const filmBaseBalance = getFilmBaseBalance(payload.settings.filmBaseSample);
-  const lightSourceBias = payload.lightSourceBias ?? [1, 1, 1];
-  const filmType = payload.filmType ?? 'negative';
-
-  for (let index = 0; index < data.length; index += 4) {
-    let r = data[index] / 255;
-    let g = data[index + 1] / 255;
-    let b = data[index + 2] / 255;
-
-    r = applyLightSourceCorrection(r, lightSourceBias[0]);
-    g = applyLightSourceCorrection(g, lightSourceBias[1]);
-    b = applyLightSourceCorrection(b, lightSourceBias[2]);
-
-    if (filmType !== 'slide') {
-      r = 1 - r;
-      g = 1 - g;
-      b = 1 - b;
-    }
-
-    r = applyFilmBaseCompensation(r, filmBaseBalance.red) * payload.settings.redBalance;
-    g = applyFilmBaseCompensation(g, filmBaseBalance.green) * payload.settings.greenBalance;
-    b = applyFilmBaseCompensation(b, filmBaseBalance.blue) * payload.settings.blueBalance;
-
-    if (residualBaseOffset) {
-      r = Math.max(0, r - residualBaseOffset[0]);
-      g = Math.max(0, g - residualBaseOffset[1]);
-      b = Math.max(0, b - residualBaseOffset[2]);
-    }
-
-    data[index] = clamp(Math.round(clamp(r, 0, 1) * 255), 0, 255);
-    data[index + 1] = clamp(Math.round(clamp(g, 0, 1) * 255), 0, 255);
-    data[index + 2] = clamp(Math.round(clamp(b, 0, 1) * 255), 0, 255);
-  }
-}
-
 function handleAutoAnalyze(payload: AutoAnalyzeRequest) {
   const document = getStoredDocument(payload.documentId);
   const analysisTargetDimension = Math.min(payload.targetMaxDimension, 1024);
@@ -1231,8 +1400,8 @@ function handleAutoAnalyze(payload: AutoAnalyzeRequest) {
   if (!ctx) throw new Error('Could not analyze auto adjustments.');
 
   const toneImageData = ctx.getImageData(0, 0, transformed.width, transformed.height);
-  const residualBaseOffset = computeResidualBaseOffsetForSourceCanvas(
-    preview.canvas,
+  const residualBaseOffset = getPinnedResidualBaseOffset(
+    document,
     payload.settings,
     payload.isColor,
     payload.filmType ?? 'negative',
@@ -1240,6 +1409,7 @@ function handleAutoAnalyze(payload: AutoAnalyzeRequest) {
     payload.outputProfileId ?? 'srgb',
     payload.lightSourceBias ?? [1, 1, 1],
     payload.flareFloor ?? null,
+    payload.profileId ?? null,
   );
   const toneHistogram = processImageData(
     toneImageData,
@@ -1262,12 +1432,17 @@ function handleAutoAnalyze(payload: AutoAnalyzeRequest) {
     residualBaseOffset,
     payload.flareFloor ?? null,
     payload.lightSourceBias ?? [1, 1, 1],
+    document.estimatedFilmBaseSample,
+    document.estimatedDensityBalance,
   );
 
   const whiteBalanceImageData = ctx.getImageData(0, 0, transformed.width, transformed.height);
-  applyAutoWhiteBalanceAnalysisStage(
+  applyAnalysisInversionStage(
     whiteBalanceImageData,
     payload,
+    payload.inputProfileId ?? 'srgb',
+    payload.outputProfileId ?? 'srgb',
+    document,
     residualBaseOffset,
   );
 
@@ -1302,10 +1477,10 @@ function handleRender(payload: RenderRequest) {
   if (!ctx) throw new Error('Could not read rendered preview.');
 
   const imageData = ctx.getImageData(0, 0, transformed.width, transformed.height);
-  const residualBaseOffset = payload.skipProcessing || payload.comparisonMode !== 'processed'
-    ? null
-    : computeResidualBaseOffsetForSourceCanvas(
-      previewSource,
+  const usesProcessedPipeline = !payload.skipProcessing && payload.comparisonMode === 'processed';
+  const residualBaseOffset = usesProcessedPipeline
+    ? getPinnedResidualBaseOffset(
+      document,
       payload.settings,
       payload.isColor,
       payload.filmType ?? 'negative',
@@ -1313,7 +1488,12 @@ function handleRender(payload: RenderRequest) {
       payload.outputProfileId ?? 'srgb',
       payload.lightSourceBias ?? [1, 1, 1],
       payload.flareFloor ?? null,
-    );
+      payload.profileId ?? null,
+    )
+    : null;
+  const pinnedHighlightDensity = usesProcessedPipeline
+    ? getPinnedHighlightDensity(document, payload, residualBaseOffset)
+    : 0;
   const histogram = payload.skipProcessing
     ? buildEmptyHistogram()
     : processImageData(
@@ -1329,7 +1509,7 @@ function handleRender(payload: RenderRequest) {
       payload.labTonalCharacterOverride,
       payload.labSaturationBias ?? 0,
       payload.labTemperatureBias ?? 0,
-      payload.highlightDensityEstimate ?? 0,
+      pinnedHighlightDensity,
       payload.inputProfileId ?? 'srgb',
       payload.outputProfileId ?? 'srgb',
       payload.profileId ?? null,
@@ -1337,8 +1517,10 @@ function handleRender(payload: RenderRequest) {
       residualBaseOffset,
       payload.flareFloor ?? null,
       payload.lightSourceBias ?? [1, 1, 1],
+      document.estimatedFilmBaseSample,
+      document.estimatedDensityBalance,
     );
-  const highlightDensity = computeHighlightDensity(histogram);
+  const highlightDensity = usesProcessedPipeline ? pinnedHighlightDensity : computeHighlightDensity(histogram);
 
   if (!payload.skipProcessing) {
     ctx.putImageData(imageData, 0, 0);
@@ -1358,9 +1540,9 @@ function handleRender(payload: RenderRequest) {
 
 function handleSampleFilmBase(payload: SampleRequest) {
   const document = getStoredDocument(payload.documentId);
-  const level = selectPreviewLevel(document.previews.map((preview) => preview.level), payload.targetMaxDimension);
-  const preview = document.previews.find((candidate) => candidate.level.id === level.id) ?? document.previews[document.previews.length - 1];
-  const transformed = renderTransformedCanvas(preview.canvas, payload.settings);
+  // Sample from the source-resolution canvas: preview levels are resampled
+  // (anti-aliased), which biases the picked base value (audit 2.8).
+  const transformed = renderTransformedCanvas(document.sourceCanvas, payload.settings);
   return sampleRegionFromTransformedCanvas(transformed, payload);
 }
 
@@ -1376,8 +1558,8 @@ async function handleExport(payload: ExportRequest) {
 
   const imageData = ctx.getImageData(0, 0, transformed.width, transformed.height);
   const filename = `${sanitizeFilenameBase(payload.options.filenameBase)}.${getExtensionFromFormat(payload.options.format)}`;
-  const residualBaseOffset = computeResidualBaseOffsetForSourceCanvas(
-    exportSource,
+  const residualBaseOffset = getPinnedResidualBaseOffset(
+    document,
     payload.settings,
     payload.isColor,
     payload.filmType ?? 'negative',
@@ -1385,7 +1567,9 @@ async function handleExport(payload: ExportRequest) {
     payload.outputProfileId ?? 'srgb',
     payload.lightSourceBias ?? [1, 1, 1],
     payload.flareFloor ?? null,
+    payload.profileId ?? null,
   );
+  const pinnedHighlightDensity = getPinnedHighlightDensity(document, payload, residualBaseOffset);
 
   if (payload.skipProcessing) {
     return {
@@ -1411,7 +1595,7 @@ async function handleExport(payload: ExportRequest) {
     payload.labTonalCharacterOverride,
     payload.labSaturationBias ?? 0,
     payload.labTemperatureBias ?? 0,
-    payload.highlightDensityEstimate ?? 0,
+    pinnedHighlightDensity,
     payload.inputProfileId ?? 'srgb',
     payload.outputProfileId ?? 'srgb',
     payload.profileId ?? null,
@@ -1419,32 +1603,17 @@ async function handleExport(payload: ExportRequest) {
     residualBaseOffset,
     payload.flareFloor ?? null,
     payload.lightSourceBias ?? [1, 1, 1],
+    document.estimatedFilmBaseSample,
+    document.estimatedDensityBalance,
   );
   ctx.putImageData(imageData, 0, 0);
 
-  const exportCanvas = resizeCanvasForExport(transformed.canvas, payload.options.targetMaxDimension);
-
-  if (payload.options.format === 'image/tiff') {
-    const exportContext = exportCanvas.getContext('2d', { willReadFrequently: true });
-    if (!exportContext) {
-      throw new Error('Could not create TIFF export canvas.');
-    }
-    const exportImage = exportContext.getImageData(0, 0, exportCanvas.width, exportCanvas.height);
-    const encoded = UTIF.encodeImage(new Uint8Array(exportImage.data), exportCanvas.width, exportCanvas.height);
-    return {
-      blob: new Blob([encoded], { type: 'image/tiff' }),
-      filename,
-    } satisfies ExportResult;
-  }
-
-  const blob = await exportCanvas.convertToBlob({
-    type: payload.options.format,
-    quality: payload.options.format === 'image/png' ? undefined : payload.options.quality,
-  });
+  const encoded = await encodeExportRaster(imageData, payload.options);
 
   return {
-    blob,
+    blob: encoded.blob,
     filename,
+    bitDepthDowngraded: encoded.bitDepthDowngraded,
   } satisfies ExportResult;
 }
 
@@ -1489,20 +1658,41 @@ async function handleContactSheet(payload: ContactSheetRequest) {
     }
 
     const imageData = sourceContext.getImageData(0, 0, transformed.width, transformed.height);
-    const residualBaseOffset = computeResidualBaseOffset(
-      imageData,
+    const cellInputProfileId = resolveStoredInputProfileId(document, colorManagement?.inputMode ?? 'auto', colorManagement?.inputProfileId ?? 'srgb');
+    const cellAnalysisArgs = {
       settings,
-      usesColorChannelPipeline(profile),
-      profile.filmType ?? 'negative',
-      resolveStoredInputProfileId(document, colorManagement?.inputMode ?? 'auto', colorManagement?.inputProfileId ?? 'srgb'),
+      isColor: usesColorChannelPipeline(profile),
+      profileId: profile.id,
+      filmType: profile.filmType ?? 'negative',
+      inputProfileId: cellInputProfileId,
+      outputProfileId: payload.exportOptions.outputProfileId,
+      lightSourceBias: payload.lightSourceBiasPerCell?.[index] ?? [1, 1, 1] as [number, number, number],
+      flareFloor: payload.flareFloorPerCell?.[index] ?? null,
+      maskTuning: profile.maskTuning,
+      colorMatrix: profile.colorMatrix,
+      tonalCharacter: profile.tonalCharacter,
+      labStyleToneCurve: payload.labStyleToneCurvePerCell?.[index],
+      labStyleChannelCurves: payload.labStyleChannelCurvesPerCell?.[index],
+      labTonalCharacterOverride: payload.labTonalCharacterOverridePerCell?.[index],
+      labSaturationBias: payload.labSaturationBiasPerCell?.[index] ?? 0,
+      labTemperatureBias: payload.labTemperatureBiasPerCell?.[index] ?? 0,
+    };
+    const residualBaseOffset = getPinnedResidualBaseOffset(
+      document,
+      settings,
+      cellAnalysisArgs.isColor,
+      cellAnalysisArgs.filmType,
+      cellInputProfileId,
       payload.exportOptions.outputProfileId,
-      payload.lightSourceBiasPerCell?.[index] ?? [1, 1, 1],
-      payload.flareFloorPerCell?.[index] ?? null,
+      cellAnalysisArgs.lightSourceBias,
+      cellAnalysisArgs.flareFloor,
+      profile.id,
     );
+    const cellHighlightDensity = getPinnedHighlightDensity(document, cellAnalysisArgs, residualBaseOffset);
     processImageData(
       imageData,
       settings,
-      usesColorChannelPipeline(profile),
+      cellAnalysisArgs.isColor,
       'processed',
       profile.maskTuning,
       profile.colorMatrix,
@@ -1512,14 +1702,16 @@ async function handleContactSheet(payload: ContactSheetRequest) {
       payload.labTonalCharacterOverridePerCell?.[index],
       payload.labSaturationBiasPerCell?.[index] ?? 0,
       payload.labTemperatureBiasPerCell?.[index] ?? 0,
-      0,
-      resolveStoredInputProfileId(document, colorManagement?.inputMode ?? 'auto', colorManagement?.inputProfileId ?? 'srgb'),
+      cellHighlightDensity,
+      cellInputProfileId,
       payload.exportOptions.outputProfileId,
       profile.id,
       profile.filmType ?? 'negative',
       residualBaseOffset,
       payload.flareFloorPerCell?.[index] ?? null,
       payload.lightSourceBiasPerCell?.[index] ?? [1, 1, 1],
+      document.estimatedFilmBaseSample,
+      document.estimatedDensityBalance,
     );
 
     const col = index % columns;
@@ -1601,6 +1793,9 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
         return;
       case 'sample-film-base':
         reply(request, handleSampleFilmBase(request.payload));
+        return;
+      case 'conversion-analysis':
+        reply(request, handleConversionAnalysis(request.payload));
         return;
       case 'detect-frame':
         reply(request, handleDetectFrame(request.payload.documentId));

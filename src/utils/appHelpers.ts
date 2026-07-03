@@ -7,6 +7,7 @@ import {
   DensityBalance,
   FilmProfile,
   HistogramMode,
+  InputProfileSpec,
   InteractionQuality,
   MaskTuning,
   SourceMetadata,
@@ -16,12 +17,14 @@ import { getFileExtension } from './imagePipeline';
 import { supportsDisplayP3Canvas } from './colorProfiles';
 import { isRawExtension } from './rawImport';
 
-export function resolveAutoInputProfileId(source: Pick<SourceMetadata, 'decoderColorProfileId' | 'embeddedColorProfileId'>): ColorProfileId {
-  return source.decoderColorProfileId ?? source.embeddedColorProfileId ?? 'srgb';
+export function resolveAutoInputProfileId(
+  source: Pick<SourceMetadata, 'decoderColorProfileId' | 'embeddedColorProfileId' | 'embeddedParsedProfile'>,
+): InputProfileSpec {
+  return source.decoderColorProfileId ?? source.embeddedColorProfileId ?? source.embeddedParsedProfile ?? 'srgb';
 }
 
 export function getResolvedInputProfileId(
-  source: Pick<SourceMetadata, 'decoderColorProfileId' | 'embeddedColorProfileId'>,
+  source: Pick<SourceMetadata, 'decoderColorProfileId' | 'embeddedColorProfileId' | 'embeddedParsedProfile'>,
   colorManagement: Pick<ColorManagementSettings, 'inputMode' | 'inputProfileId'>,
 ) {
   return colorManagement.inputMode === 'override'
@@ -35,7 +38,7 @@ export function createDocumentColorManagement(
 ): ColorManagementSettings {
   return {
     ...DEFAULT_COLOR_MANAGEMENT,
-    inputProfileId: resolveAutoInputProfileId(source),
+    inputProfileId: source.decoderColorProfileId ?? source.embeddedColorProfileId ?? DEFAULT_COLOR_MANAGEMENT.inputProfileId,
     outputProfileId: exportOptions.outputProfileId,
     embedOutputProfile: exportOptions.embedOutputProfile,
   };
@@ -174,7 +177,7 @@ export type QueuedPreviewRender = {
   estimatedDensityBalance?: DensityBalance | null;
   comparisonMode: 'processed' | 'original';
   targetMaxDimension: number;
-  inputProfileId: ColorProfileId;
+  inputProfileId: InputProfileSpec;
   outputProfileId: ColorProfileId;
   previewMode: 'draft' | 'settled';
   interactionQuality: InteractionQuality | null;

@@ -1,7 +1,30 @@
 export type FilmType = 'color' | 'bw';
 export type CropTab = 'Film' | 'Print' | 'Social' | 'Digital';
 export type ScannerType = 'flatbed' | 'camera' | 'dedicated' | 'smartphone';
-export type ColorProfileId = 'srgb' | 'display-p3' | 'adobe-rgb';
+export type ColorProfileId = 'srgb' | 'display-p3' | 'adobe-rgb' | 'linear';
+
+// Transfer curve resolved from an embedded ICC profile. Table and parametric
+// TRCs are reduced to one of these two shapes at parse time so the CPU
+// pipeline and the WGSL shader consume the exact same description.
+export type ParsedTransferCurve =
+  | { type: 'srgb' }
+  | { type: 'gamma'; gamma: number };
+
+// Input profile parsed numerically from an embedded ICC (matrix + TRC or
+// gray). Serializable so it can cross the worker boundary and be persisted
+// with the document. Only ever used on the input side of the pipeline —
+// outputs stay on the built-in ColorProfileId set.
+export interface ParsedInputProfile {
+  kind: 'parsed-icc';
+  name: string;
+  colorSpace: 'rgb' | 'gray';
+  /** Linear RGB → XYZ (D65-adapted), row-major 3×3. */
+  toXyzD65: number[];
+  trc: ParsedTransferCurve;
+}
+
+/** Anything the pipeline accepts as an input color profile. */
+export type InputProfileSpec = ColorProfileId | ParsedInputProfile;
 export type FilmProfileType = 'negative' | 'slide';
 export type FilmProfileCategory = 'Kodak' | 'Fuji' | 'Ilford' | 'CineStill' | 'Lomography' | 'Harman' | 'Kentmere' | 'Foma' | 'Rollei' | 'Generic';
 export type CropSource = 'auto' | 'manual';
@@ -87,6 +110,7 @@ export interface ExifMetadata {
 }
 
 export type ExportFormat = 'image/jpeg' | 'image/png' | 'image/webp' | 'image/tiff';
+export type ExportBitDepth = 8 | 16;
 export type TileSourceKind = 'preview' | 'source';
 export type PreviewMode = 'draft' | 'settled';
 export type RenderBackendMode = 'gpu-preview' | 'gpu-tiled-render' | 'cpu-worker';
@@ -210,6 +234,7 @@ export interface NotificationSettings {
 
 export interface ExportOptions {
   format: ExportFormat;
+  bitDepth: ExportBitDepth;
   quality: number;
   filenameBase: string;
   embedMetadata: boolean;
@@ -223,6 +248,7 @@ export interface QuickExportPreset {
   id: string;
   name: string;
   format: ExportFormat;
+  bitDepth: ExportBitDepth;
   quality: number;
   outputProfileId: ColorProfileId;
   embedMetadata: boolean;
@@ -336,6 +362,10 @@ export interface SourceMetadata {
   exif?: ExifMetadata;
   embeddedColorProfileName?: string | null;
   embeddedColorProfileId?: ColorProfileId | null;
+  // Set when the embedded ICC didn't match a built-in profile by name but was
+  // parsed numerically (matrix + TRC or gray). Takes part in auto input
+  // profile resolution alongside embeddedColorProfileId.
+  embeddedParsedProfile?: ParsedInputProfile | null;
   decoderColorProfileName?: string | null;
   decoderColorProfileId?: ColorProfileId | null;
   unsupportedColorProfileName?: string | null;
@@ -355,7 +385,6 @@ export interface RawDecodeResult {
   height: number;
   data: ArrayLike<number>;
   color_space: string;
-  white_balance?: [number, number, number] | null;
   orientation?: number | null;
 }
 
@@ -409,6 +438,7 @@ export interface DecodeRequest {
   precomputedFilmBaseSample?: FilmBaseSample | null;
   declaredColorProfileName?: string | null;
   declaredColorProfileId?: ColorProfileId | null;
+  mirrorHorizontal?: boolean;
 }
 
 export interface RenderRequest {
@@ -419,7 +449,7 @@ export interface RenderRequest {
   filmType?: FilmProfileType;
   estimatedFilmBaseSample?: FilmBaseSample | null;
   estimatedDensityBalance?: DensityBalance | null;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   revision: number;
   targetMaxDimension: number;
@@ -471,7 +501,7 @@ export interface ExportRequest {
   profileId?: string | null;
   filmType?: FilmProfileType;
   estimatedDensityBalance?: DensityBalance | null;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   options: ExportOptions;
   sourceExif?: ExifMetadata;
@@ -492,6 +522,12 @@ export interface ExportRequest {
 export interface ExportResult {
   blob: Blob;
   filename: string;
+  /**
+   * Set when a requested 16-bit export was degraded to 8-bit because only an
+   * 8-bit source raster was available. The export path uses this to warn the
+   * user instead of silently shipping a lower-depth file.
+   */
+  bitDepthDowngraded?: boolean;
 }
 
 export interface ContactSheetCell {
@@ -662,7 +698,7 @@ export interface AutoAnalyzeRequest {
   isColor: boolean;
   profileId?: string | null;
   filmType?: FilmProfileType;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   targetMaxDimension: number;
   maskTuning?: MaskTuning;
@@ -676,6 +712,49 @@ export interface AutoAnalyzeRequest {
   highlightDensityEstimate?: number;
   flareFloor?: [number, number, number] | null;
   lightSourceBias?: [number, number, number];
+}
+
+// Pinned conversion analysis (audit Phase C): data-dependent conversion
+// parameters computed once per (document, relevant settings) at a fixed
+// resolution in the worker, then passed identically to preview, tiles,
+// and export so they cannot drift apart.
+export interface ConversionAnalysisRequest {
+  documentId: string;
+  settings: ConversionSettings;
+  isColor: boolean;
+  profileId?: string | null;
+  filmType?: FilmProfileType;
+  inputProfileId?: InputProfileSpec;
+  outputProfileId?: ColorProfileId;
+  lightSourceBias?: [number, number, number];
+  flareFloor?: [number, number, number] | null;
+  maskTuning?: MaskTuning;
+  colorMatrix?: ColorMatrix;
+  tonalCharacter?: TonalCharacter;
+  labStyleToneCurve?: CurvePoint[];
+  labStyleChannelCurves?: { r?: CurvePoint[]; g?: CurvePoint[]; b?: CurvePoint[] };
+  labTonalCharacterOverride?: Partial<TonalCharacter>;
+  labSaturationBias?: number;
+  labTemperatureBias?: number;
+}
+
+export interface ConversionParametersDebug {
+  baseSampleSource: 'manual-picker' | 'auto-estimated-border' | 'none';
+  baseDensity: [number, number, number];
+  densityScale: [number, number, number];
+  densityScaleSource: DensityBalance['source'] | 'neutral';
+  inputProfileId: InputProfileSpec;
+  outputProfileId: ColorProfileId;
+  flareFloor: [number, number, number] | null;
+  residualBaseOffset: [number, number, number] | null;
+  highlightDensity: number;
+}
+
+export interface ConversionAnalysisResult {
+  type: 'conversion-analysis';
+  residualBaseOffset: [number, number, number] | null;
+  highlightDensity: number;
+  debug: ConversionParametersDebug;
 }
 
 export interface DustDetectRequest {
@@ -714,7 +793,7 @@ export interface AutoAnalyzeResult {
 export interface SampleRequest {
   documentId: string;
   settings: ConversionSettings;
-  inputProfileId?: ColorProfileId;
+  inputProfileId?: InputProfileSpec;
   outputProfileId?: ColorProfileId;
   targetMaxDimension: number;
   x: number;
